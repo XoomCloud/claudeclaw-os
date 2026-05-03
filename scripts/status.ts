@@ -94,33 +94,66 @@ async function main() {
   const envPath = path.join(PROJECT_ROOT, '.env');
   const env = parseEnvFile(envPath);
 
-  // Bot token
-  if (env.TELEGRAM_BOT_TOKEN) {
-    try {
-      const res = await fetch(
-        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getMe`,
-      );
-      const data = (await res.json()) as {
-        ok: boolean;
-        result?: { username?: string };
-      };
-      if (data.ok && data.result?.username) {
-        ok(`Bot token: @${data.result.username}`);
-      } else {
-        fail('Bot token: invalid');
+  const messenger = (env.MESSENGER_TYPE || 'telegram').toLowerCase();
+
+  if (messenger === 'discord') {
+    // Discord bot token
+    if (env.DISCORD_BOT_TOKEN) {
+      try {
+        const res = await fetch('https://discord.com/api/v10/users/@me', {
+          headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` },
+        });
+        const data = (await res.json().catch(() => ({}))) as { username?: string; id?: string };
+        if (res.ok && data.username) {
+          ok(`Discord bot: ${data.username} (id ${data.id})`);
+        } else {
+          fail('Discord bot token: invalid');
+        }
+      } catch {
+        warn('Discord bot token: set but could not validate (network error)');
       }
-    } catch {
-      warn('Bot token: set but could not validate (network error)');
+    } else {
+      fail('Discord bot token: not configured');
+    }
+
+    if (env.DISCORD_ALLOWED_USER_ID) {
+      ok(`Discord user ID: ${env.DISCORD_ALLOWED_USER_ID}`);
+    } else {
+      fail('Discord user ID: not set — bot will reject all messages');
+    }
+
+    if (env.DISCORD_ALLOWED_CHANNEL_ID) {
+      ok(`Discord channel ID: ${env.DISCORD_ALLOWED_CHANNEL_ID}`);
     }
   } else {
-    fail('Bot token: not configured');
-  }
+    // Telegram bot token
+    if (env.TELEGRAM_BOT_TOKEN) {
+      try {
+        const res = await fetch(
+          `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getMe`,
+        );
+        const data = (await res.json()) as {
+          ok: boolean;
+          result?: { username?: string };
+        };
+        if (data.ok && data.result?.username) {
+          ok(`Bot token: @${data.result.username}`);
+        } else {
+          fail('Bot token: invalid');
+        }
+      } catch {
+        warn('Bot token: set but could not validate (network error)');
+      }
+    } else {
+      fail('Bot token: not configured');
+    }
 
-  // Chat ID
-  if (env.ALLOWED_CHAT_ID) {
-    ok(`Chat ID: ${env.ALLOWED_CHAT_ID}`);
-  } else {
-    warn('Chat ID: not set');
+    // Chat ID
+    if (env.ALLOWED_CHAT_ID) {
+      ok(`Chat ID: ${env.ALLOWED_CHAT_ID}`);
+    } else {
+      warn('Chat ID: not set');
+    }
   }
 
   // Voice STT
@@ -210,7 +243,9 @@ async function main() {
   console.log(`  ${c.gray}${'─'.repeat(17)}${c.reset}`);
 
   // Determine overall status
-  const hasToken = !!env.TELEGRAM_BOT_TOKEN;
+  const hasToken = messenger === 'discord'
+    ? !!(env.DISCORD_BOT_TOKEN && env.DISCORD_ALLOWED_USER_ID)
+    : !!env.TELEGRAM_BOT_TOKEN;
   const hasClaude = (() => {
     try {
       execSync('which claude', { stdio: 'pipe' });

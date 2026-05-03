@@ -3,9 +3,10 @@ import path from 'path';
 
 import { loadAgentConfig, listAgentIds, resolveAgentDir, resolveAgentClaudeMd } from './agent-config.js';
 import { createBot } from './bot.js';
+import { createDiscordBot, DiscordBot } from './discord-bot.js';
 import { createSignalBot, SignalBot } from './signal-bot.js';
 import { checkPendingMigrations } from './migrations.js';
-import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CONFIG, GOOGLE_API_KEY, setAgentOverrides, SECURITY_PIN_HASH, IDLE_LOCK_MINUTES, EMERGENCY_KILL_PHRASE, WARROOM_ENABLED, WARROOM_PORT, MESSENGER_TYPE, SIGNAL_AUTHORIZED_RECIPIENTS, SIGNAL_PHONE_NUMBER } from './config.js';
+import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CONFIG, GOOGLE_API_KEY, setAgentOverrides, SECURITY_PIN_HASH, IDLE_LOCK_MINUTES, EMERGENCY_KILL_PHRASE, WARROOM_ENABLED, WARROOM_PORT, MESSENGER_TYPE, SIGNAL_AUTHORIZED_RECIPIENTS, SIGNAL_PHONE_NUMBER, DISCORD_ALLOWED_CHANNEL_ID, DISCORD_ALLOWED_USER_ID, DISCORD_BOT_TOKEN } from './config.js';
 import { startDashboard } from './dashboard.js';
 import { initDatabase, cleanupOldMissionTasks, insertAuditLog } from './db.js';
 import { initSecurity, setAuditCallback } from './security.js';
@@ -117,10 +118,20 @@ async function main(): Promise<void> {
   }
 
   // Messenger-specific startup checks. Signal uses signal-cli (no token),
-  // Telegram needs a bot token from @BotFather.
+  // Discord needs a bot token + allowed user ID, Telegram needs a bot token
+  // from @BotFather.
   if (MESSENGER_TYPE === 'signal') {
     if (!SIGNAL_PHONE_NUMBER) {
       logger.error('SIGNAL_PHONE_NUMBER not set. Link signal-cli first, then set it in .env.');
+      process.exit(1);
+    }
+  } else if (MESSENGER_TYPE === 'discord') {
+    if (!DISCORD_BOT_TOKEN) {
+      logger.error('DISCORD_BOT_TOKEN not set. Create a bot at https://discord.com/developers/applications and set it in .env.');
+      process.exit(1);
+    }
+    if (!DISCORD_ALLOWED_USER_ID) {
+      logger.error('DISCORD_ALLOWED_USER_ID not set. With Developer Mode on, right-click your username in Discord and pick "Copy User ID".');
       process.exit(1);
     }
   } else {
@@ -188,25 +199,35 @@ async function main(): Promise<void> {
 
   cleanupOldUploads();
 
-  // ── Messenger: create either the Telegram bot (grammy) or the Signal bot
-  // (signal-cli JSON-RPC). Both expose a messenger-agnostic `sendToPrimary`
-  // helper used by scheduler, War Room status messages, and OAuth alerts.
+  // ── Messenger: create the Telegram bot (grammy), the Signal bot (signal-cli
+  // JSON-RPC), or the Discord bot (discord.js). All three expose a
+  // messenger-agnostic `sendToPrimary` helper used by the scheduler, War Room
+  // status messages, and OAuth alerts.
   const useSignal = MESSENGER_TYPE === 'signal';
-  const bot = useSignal ? null : createBot();
+  const useDiscord = MESSENGER_TYPE === 'discord';
+  const bot = (useSignal || useDiscord) ? null : createBot();
   const signalBot: SignalBot | null = useSignal ? createSignalBot() : null;
+  const discordBot: DiscordBot | null = useDiscord ? createDiscordBot() : null;
 
   // Recipient for status messages (scheduler output, War Room errors, etc.).
   // Telegram: ALLOWED_CHAT_ID. Signal: first entry in SIGNAL_AUTHORIZED_RECIPIENTS,
-  // falling back to the daemon's own number (sync-to-self works for testing).
+  // falling back to the daemon's own number. Discord: prefer
+  // DISCORD_ALLOWED_CHANNEL_ID (server channel), fall back to the user's DM.
   const primaryRecipient = useSignal
     ? (SIGNAL_AUTHORIZED_RECIPIENTS[0] ?? SIGNAL_PHONE_NUMBER)
-    : ALLOWED_CHAT_ID;
+    : useDiscord
+      ? (DISCORD_ALLOWED_CHANNEL_ID || DISCORD_ALLOWED_USER_ID)
+      : ALLOWED_CHAT_ID;
 
   async function sendToPrimary(text: string): Promise<void> {
     if (!primaryRecipient) return;
     if (useSignal && signalBot) {
       await signalBot.sendTo(primaryRecipient, text).catch((err) =>
         logger.error({ err }, 'Signal status message failed'),
+      );
+    } else if (useDiscord && discordBot) {
+      await discordBot.sendTo(primaryRecipient, text).catch((err) =>
+        logger.error({ err }, 'Discord status message failed'),
       );
     } else if (bot) {
       const { splitMessage } = await import('./bot.js');
@@ -373,6 +394,7 @@ async function main(): Promise<void> {
     releaseLock();
     if (bot) await bot.stop();
     if (signalBot) await signalBot.stop();
+    if (discordBot) await discordBot.stop();
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown());
@@ -396,7 +418,23 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (!bot) throw new Error('Telegram bot not created and Signal not active — check MESSENGER_TYPE.');
+  if (useDiscord && discordBot) {
+    await discordBot.start();
+    setTelegramConnected(true); // reuse the connected flag for dashboard state
+    setBotInfo('discord', `ClaudeClaw (Discord)`);
+    if (AGENT_ID === 'main') {
+      console.log(`\n  ClaudeClaw online via Discord (allowed user: ${DISCORD_ALLOWED_USER_ID})`);
+      if (!DISCORD_ALLOWED_CHANNEL_ID) {
+        console.log('  No DISCORD_ALLOWED_CHANNEL_ID set — only DMs and @mentions will be processed.');
+      }
+      console.log();
+    } else {
+      console.log(`\n  ClaudeClaw agent [${AGENT_ID}] online via Discord\n`);
+    }
+    return;
+  }
+
+  if (!bot) throw new Error('No messenger bot created — check MESSENGER_TYPE in .env (telegram, signal, or discord).');
 
   // Clear any existing webhook so polling works cleanly (e.g., if token was
   // previously used with a webhook-based bot or another ClaudeClaw instance).

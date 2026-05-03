@@ -12,6 +12,9 @@ const envConfig = readEnvFile([
   'SIGNAL_RPC_HOST',
   'SIGNAL_RPC_PORT',
   'SIGNAL_AUTHORIZED_RECIPIENTS',
+  'DISCORD_BOT_TOKEN',
+  'DISCORD_ALLOWED_USER_ID',
+  'DISCORD_ALLOWED_CHANNEL_ID',
   'GROQ_API_KEY',
   'ELEVENLABS_API_KEY',
   'ELEVENLABS_VOICE_ID',
@@ -86,10 +89,11 @@ export const ALLOWED_CHAT_ID =
   process.env.ALLOWED_CHAT_ID || envConfig.ALLOWED_CHAT_ID || '';
 
 // ── Messenger adapter selection ──────────────────────────────────────
-// Which messenger front-end runs: 'telegram' (default, grammy via bot.ts)
-// or 'signal' (signal-cli JSON-RPC via signal-bot.ts). Picked once at
-// startup in index.ts; the two code paths never run simultaneously.
-export type MessengerType = 'telegram' | 'signal';
+// Which messenger front-end runs: 'telegram' (default, grammy via bot.ts),
+// 'signal' (signal-cli JSON-RPC via signal-bot.ts), or 'discord' (discord.js
+// via discord-bot.ts). Picked once at startup in index.ts; the code paths
+// never run simultaneously.
+export type MessengerType = 'telegram' | 'signal' | 'discord';
 export const MESSENGER_TYPE: MessengerType =
   ((process.env.MESSENGER_TYPE || envConfig.MESSENGER_TYPE || 'telegram').toLowerCase() as MessengerType);
 
@@ -107,6 +111,21 @@ export const SIGNAL_RPC_PORT = parseInt(
 export const SIGNAL_AUTHORIZED_RECIPIENTS = (
   process.env.SIGNAL_AUTHORIZED_RECIPIENTS || envConfig.SIGNAL_AUTHORIZED_RECIPIENTS || ''
 ).split(',').map((s) => s.trim()).filter(Boolean);
+
+// ── Discord (alternative messenger via discord.js) ───────────────────
+// Bot token from https://discord.com/developers/applications. The bot must
+// be invited to a server with the Message Content + DM intents enabled.
+export const DISCORD_BOT_TOKEN =
+  process.env.DISCORD_BOT_TOKEN || envConfig.DISCORD_BOT_TOKEN || '';
+// Discord user ID (snowflake) authorised to talk to the bot. Right-click
+// your username in Discord with Developer Mode on and pick "Copy User ID".
+export const DISCORD_ALLOWED_USER_ID =
+  process.env.DISCORD_ALLOWED_USER_ID || envConfig.DISCORD_ALLOWED_USER_ID || '';
+// Optional: restrict guild messages to a specific channel ID. If unset, the
+// bot accepts DMs from DISCORD_ALLOWED_USER_ID and any guild channel where
+// it's mentioned. Set this to lock guild interactions to one channel.
+export const DISCORD_ALLOWED_CHANNEL_ID =
+  process.env.DISCORD_ALLOWED_CHANNEL_ID || envConfig.DISCORD_ALLOWED_CHANNEL_ID || '';
 
 export const WHATSAPP_ENABLED =
   (process.env.WHATSAPP_ENABLED || envConfig.WHATSAPP_ENABLED || '').toLowerCase() === 'true';
@@ -293,7 +312,7 @@ export const EXFILTRATION_GUARD_ENABLED =
   (process.env.EXFILTRATION_GUARD_ENABLED || envConfig.EXFILTRATION_GUARD_ENABLED || 'true').toLowerCase() === 'true';
 export const PROTECTED_ENV_VARS = (
   process.env.PROTECTED_ENV_VARS || envConfig.PROTECTED_ENV_VARS ||
-  'ANTHROPIC_API_KEY,CLAUDE_CODE_OAUTH_TOKEN,DB_ENCRYPTION_KEY,TELEGRAM_BOT_TOKEN,SLACK_USER_TOKEN,GROQ_API_KEY,ELEVENLABS_API_KEY,GOOGLE_API_KEY'
+  'ANTHROPIC_API_KEY,CLAUDE_CODE_OAUTH_TOKEN,DB_ENCRYPTION_KEY,TELEGRAM_BOT_TOKEN,DISCORD_BOT_TOKEN,SLACK_USER_TOKEN,GROQ_API_KEY,ELEVENLABS_API_KEY,GOOGLE_API_KEY'
 ).split(',').map((s) => s.trim()).filter(Boolean);
 
 // ── War Room (voice meeting via Pipecat WebSocket) ──────────────────

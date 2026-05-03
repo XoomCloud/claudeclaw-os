@@ -144,6 +144,20 @@ async function validateBotToken(token: string): Promise<{ valid: boolean; userna
   }
 }
 
+async function validateDiscordToken(token: string): Promise<{ valid: boolean; username?: string; id?: string }> {
+  try {
+    const res = await fetch('https://discord.com/api/v10/users/@me', {
+      headers: { Authorization: `Bot ${token}` },
+    });
+    if (!res.ok) return { valid: false };
+    const data = (await res.json()) as { id?: string; username?: string };
+    if (data.id && data.username) return { valid: true, username: data.username, id: data.id };
+    return { valid: false };
+  } catch {
+    return { valid: false };
+  }
+}
+
 const PLATFORM = process.platform;
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -581,8 +595,8 @@ async function main() {
   info('Full skills catalog: https://github.com/anthropics/claude-code/tree/main/skills');
   console.log();
 
-  // ── 8. API keys ───────────────────────────────────────────────────────────
-  section('Telegram');
+  // ── 8. Messenger choice ───────────────────────────────────────────────────
+  section('Choose your messenger');
 
   const envPath = path.join(PROJECT_ROOT, '.env');
   const env: Record<string, string> = fs.existsSync(envPath) ? parseEnvFile(envPath) : {};
@@ -590,86 +604,205 @@ async function main() {
   // Persist CLAUDECLAW_CONFIG determined in section 6
   env.CLAUDECLAW_CONFIG = claudeclawConfigDir;
 
-  let botUsername = '';
-  if (env.TELEGRAM_BOT_TOKEN) {
-    const s = spinner('Validating existing bot token...');
-    const r = await validateBotToken(env.TELEGRAM_BOT_TOKEN);
-    if (r.valid) {
-      botUsername = r.username || '';
-      s.stop('ok', `Bot: @${botUsername}`);
-    } else {
-      s.stop('fail', 'Existing token invalid — enter a new one');
-      delete env.TELEGRAM_BOT_TOKEN;
-    }
+  info('ClaudeClaw can run on Telegram or Discord. Pick the one you use most.');
+  info('You can switch later by editing MESSENGER_TYPE in .env and re-running setup.');
+  console.log();
+  bullet(`${c.bold}telegram${c.reset} ${c.gray}— bot via @BotFather, mobile + desktop, voice + media${c.reset}`);
+  bullet(`${c.bold}discord${c.reset}  ${c.gray}— bot via discord.com/developers, DMs and/or a server channel${c.reset}`);
+  console.log();
+
+  const existingMessenger = (env.MESSENGER_TYPE || '').toLowerCase();
+  const messengerDefault = existingMessenger === 'discord' ? 'discord' : 'telegram';
+
+  let messengerChoice = '';
+  while (!messengerChoice) {
+    const ans = (await ask('Which messenger?', messengerDefault)).toLowerCase();
+    if (ans === 'telegram' || ans === 'tg' || ans === 't') messengerChoice = 'telegram';
+    else if (ans === 'discord' || ans === 'd') messengerChoice = 'discord';
+    else warn('Type "telegram" or "discord".');
   }
+  env.MESSENGER_TYPE = messengerChoice;
 
-  if (!env.TELEGRAM_BOT_TOKEN) {
-    console.log();
-    info('You need a Telegram bot token. Get one from @BotFather:');
-    bullet('Open Telegram → search @BotFather');
-    bullet('Send /newbot');
-    bullet('Follow the prompts, copy the token it gives you');
-    console.log();
+  let botUsername = '';
 
-    let valid = false;
-    while (!valid) {
-      const token = await ask('Paste your bot token');
-      if (!token) { console.log(`  ${c.red}Required.${c.reset}`); continue; }
-      const s = spinner('Validating...');
-      const r = await validateBotToken(token);
+  if (messengerChoice === 'telegram') {
+    section('Telegram');
+
+    if (env.TELEGRAM_BOT_TOKEN) {
+      const s = spinner('Validating existing bot token...');
+      const r = await validateBotToken(env.TELEGRAM_BOT_TOKEN);
       if (r.valid) {
-        env.TELEGRAM_BOT_TOKEN = token;
         botUsername = r.username || '';
         s.stop('ok', `Bot: @${botUsername}`);
-        valid = true;
       } else {
-        s.stop('fail', 'Invalid token. Try again.');
+        s.stop('fail', 'Existing token invalid — enter a new one');
+        delete env.TELEGRAM_BOT_TOKEN;
       }
     }
-  }
 
-  console.log();
-  if (env.ALLOWED_CHAT_ID) {
-    ok(`Chat ID: ${env.ALLOWED_CHAT_ID}`);
-  } else {
-    info('Your chat ID locks the bot so only YOU can talk to it.');
-    info('We\'ll detect it automatically. Just message your bot on Telegram:');
-    console.log();
-    bullet('Open Telegram on your phone or desktop');
-    bullet(`Search for your bot: @${botUsername || 'your_bot_username'}`);
-    bullet('Tap Start or send any message to it');
-    console.log();
+    if (!env.TELEGRAM_BOT_TOKEN) {
+      console.log();
+      info('You need a Telegram bot token. Get one from @BotFather:');
+      bullet('Open Telegram → search @BotFather');
+      bullet('Send /newbot');
+      bullet('Follow the prompts, copy the token it gives you');
+      console.log();
 
-    const wantAuto = await confirm('Ready? Send a message to your bot, then press Y');
-
-    if (wantAuto) {
-      const s = spinner('Waiting for your message...');
-      let detected = '';
-      for (let attempt = 0; attempt < 30; attempt++) {
-        await sleep(2000);
-        try {
-          const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getUpdates?limit=5&timeout=0`);
-          const data = (await res.json()) as { ok: boolean; result?: Array<{ message?: { chat?: { id?: number } } }> };
-          if (data.ok && data.result?.length) {
-            const chatId = data.result[data.result.length - 1]?.message?.chat?.id;
-            if (chatId) {
-              detected = String(chatId);
-              break;
-            }
-          }
-        } catch { /* retry */ }
+      let valid = false;
+      while (!valid) {
+        const token = await ask('Paste your bot token');
+        if (!token) { console.log(`  ${c.red}Required.${c.reset}`); continue; }
+        const s = spinner('Validating...');
+        const r = await validateBotToken(token);
+        if (r.valid) {
+          env.TELEGRAM_BOT_TOKEN = token;
+          botUsername = r.username || '';
+          s.stop('ok', `Bot: @${botUsername}`);
+          valid = true;
+        } else {
+          s.stop('fail', 'Invalid token. Try again.');
+        }
       }
+    }
 
-      if (detected) {
-        s.stop('ok', `Detected chat ID: ${detected}`);
-        env.ALLOWED_CHAT_ID = detected;
-      } else {
-        s.stop('warn', 'No message detected. You can add ALLOWED_CHAT_ID to .env later.');
-        info('The bot will show your chat ID the first time you message it.');
-      }
+    console.log();
+    if (env.ALLOWED_CHAT_ID) {
+      ok(`Chat ID: ${env.ALLOWED_CHAT_ID}`);
     } else {
-      info('No problem. The bot will show your chat ID the first time you');
-      info('message it. Add it to .env and restart.');
+      info('Your chat ID locks the bot so only YOU can talk to it.');
+      info('We\'ll detect it automatically. Just message your bot on Telegram:');
+      console.log();
+      bullet('Open Telegram on your phone or desktop');
+      bullet(`Search for your bot: @${botUsername || 'your_bot_username'}`);
+      bullet('Tap Start or send any message to it');
+      console.log();
+
+      const wantAuto = await confirm('Ready? Send a message to your bot, then press Y');
+
+      if (wantAuto) {
+        const s = spinner('Waiting for your message...');
+        let detected = '';
+        for (let attempt = 0; attempt < 30; attempt++) {
+          await sleep(2000);
+          try {
+            const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getUpdates?limit=5&timeout=0`);
+            const data = (await res.json()) as { ok: boolean; result?: Array<{ message?: { chat?: { id?: number } } }> };
+            if (data.ok && data.result?.length) {
+              const chatId = data.result[data.result.length - 1]?.message?.chat?.id;
+              if (chatId) {
+                detected = String(chatId);
+                break;
+              }
+            }
+          } catch { /* retry */ }
+        }
+
+        if (detected) {
+          s.stop('ok', `Detected chat ID: ${detected}`);
+          env.ALLOWED_CHAT_ID = detected;
+        } else {
+          s.stop('warn', 'No message detected. You can add ALLOWED_CHAT_ID to .env later.');
+          info('The bot will show your chat ID the first time you message it.');
+        }
+      } else {
+        info('No problem. The bot will show your chat ID the first time you');
+        info('message it. Add it to .env and restart.');
+      }
+    }
+  } else {
+    // ── Discord ─────────────────────────────────────────────────────────
+    section('Discord');
+
+    if (env.DISCORD_BOT_TOKEN) {
+      const s = spinner('Validating existing Discord bot token...');
+      const r = await validateDiscordToken(env.DISCORD_BOT_TOKEN);
+      if (r.valid) {
+        botUsername = r.username || '';
+        s.stop('ok', `Bot: ${botUsername} (id ${r.id})`);
+      } else {
+        s.stop('fail', 'Existing token invalid — enter a new one');
+        delete env.DISCORD_BOT_TOKEN;
+      }
+    }
+
+    if (!env.DISCORD_BOT_TOKEN) {
+      console.log();
+      info('You need a Discord bot token. Create one in two minutes:');
+      bullet('Go to https://discord.com/developers/applications');
+      bullet('Click "New Application", name it (e.g. "ClaudeClaw")');
+      bullet('Open the "Bot" tab → click "Reset Token" → copy the token');
+      bullet('Under "Privileged Gateway Intents" toggle ON: MESSAGE CONTENT INTENT');
+      console.log();
+
+      let valid = false;
+      while (!valid) {
+        const token = await ask('Paste your Discord bot token');
+        if (!token) { console.log(`  ${c.red}Required.${c.reset}`); continue; }
+        const s = spinner('Validating...');
+        const r = await validateDiscordToken(token);
+        if (r.valid) {
+          env.DISCORD_BOT_TOKEN = token;
+          botUsername = r.username || '';
+          s.stop('ok', `Bot: ${botUsername} (id ${r.id})`);
+          valid = true;
+        } else {
+          s.stop('fail', 'Invalid token. Try again.');
+        }
+      }
+
+      console.log();
+      info('Now invite the bot to a server (or skip this if you only want DMs):');
+      bullet('In the developer portal: OAuth2 → URL Generator');
+      bullet('Scopes: check "bot"');
+      bullet('Bot Permissions: Send Messages, Read Message History, Attach Files');
+      bullet('Open the generated URL and pick a server you own');
+      console.log();
+    }
+
+    console.log();
+    if (env.DISCORD_ALLOWED_USER_ID) {
+      ok(`Allowed user ID: ${env.DISCORD_ALLOWED_USER_ID}`);
+    } else {
+      info('Your Discord user ID locks the bot so only YOU can talk to it.');
+      info('Discord doesn\'t auto-detect this — you have to copy it manually:');
+      console.log();
+      bullet('Open Discord → Settings → Advanced → enable "Developer Mode"');
+      bullet('Right-click your username anywhere → "Copy User ID"');
+      bullet('Paste it below (it\'s a long number like 123456789012345678)');
+      console.log();
+
+      let userId = '';
+      while (!userId) {
+        const input = (await ask('Your Discord user ID')).trim();
+        if (!input) { warn('Required. Right-click your name → Copy User ID.'); continue; }
+        if (!/^\d{17,20}$/.test(input)) {
+          warn('That doesn\'t look like a Discord user ID (should be 17-20 digits).');
+          continue;
+        }
+        userId = input;
+      }
+      env.DISCORD_ALLOWED_USER_ID = userId;
+      ok(`User ID set: ${userId}`);
+    }
+
+    console.log();
+    if (env.DISCORD_ALLOWED_CHANNEL_ID) {
+      ok(`Allowed channel ID: ${env.DISCORD_ALLOWED_CHANNEL_ID}`);
+    } else {
+      info('Optional: lock guild messages to one specific channel.');
+      info('Without this, the bot only responds in DMs and when @mentioned.');
+      console.log();
+      const wantChannel = await confirm('Set a specific channel ID?', false);
+      if (wantChannel) {
+        bullet('In Discord, right-click the channel → "Copy Channel ID"');
+        const chId = (await ask('Channel ID (Enter to skip)')).trim();
+        if (/^\d{17,20}$/.test(chId)) {
+          env.DISCORD_ALLOWED_CHANNEL_ID = chId;
+          ok(`Channel ID set: ${chId}`);
+        } else if (chId) {
+          warn('Skipped — that didn\'t look like a channel ID.');
+        }
+      }
     }
   }
 
@@ -831,9 +964,17 @@ async function main() {
     '# ClaudeClaw — generated by setup wizard',
     '# Edit freely. Re-run: npm run setup',
     '',
-    '# ── Required ──────────────────────────────────────────────────',
+    '# ── Messenger ─────────────────────────────────────────────────',
+    `MESSENGER_TYPE=${env.MESSENGER_TYPE || 'telegram'}`,
+    '',
+    '# ── Telegram ──────────────────────────────────────────────────',
     `TELEGRAM_BOT_TOKEN=${env.TELEGRAM_BOT_TOKEN || ''}`,
     `ALLOWED_CHAT_ID=${env.ALLOWED_CHAT_ID || ''}`,
+    '',
+    '# ── Discord ───────────────────────────────────────────────────',
+    `DISCORD_BOT_TOKEN=${env.DISCORD_BOT_TOKEN || ''}`,
+    `DISCORD_ALLOWED_USER_ID=${env.DISCORD_ALLOWED_USER_ID || ''}`,
+    env.DISCORD_ALLOWED_CHANNEL_ID ? `DISCORD_ALLOWED_CHANNEL_ID=${env.DISCORD_ALLOWED_CHANNEL_ID}` : '# DISCORD_ALLOWED_CHANNEL_ID=',
     '',
     '# ── Config directory (personal config, never committed) ───────',
     `CLAUDECLAW_CONFIG=${env.CLAUDECLAW_CONFIG || ''}`,
@@ -869,7 +1010,7 @@ async function main() {
   ];
 
   // Preserve unknown keys
-  const known = new Set(['TELEGRAM_BOT_TOKEN','ALLOWED_CHAT_ID','CLAUDECLAW_CONFIG','ANTHROPIC_API_KEY','GROQ_API_KEY','ELEVENLABS_API_KEY','ELEVENLABS_VOICE_ID','GOOGLE_API_KEY','CLAUDE_CODE_OAUTH_TOKEN','WHATSAPP_ENABLED','WARROOM_ENABLED','DB_ENCRYPTION_KEY','DASHBOARD_TOKEN','DASHBOARD_PORT','DASHBOARD_URL','SECURITY_PIN_HASH','IDLE_LOCK_MINUTES','EMERGENCY_KILL_PHRASE','DESTRUCTIVE_CONFIRM']);
+  const known = new Set(['MESSENGER_TYPE','TELEGRAM_BOT_TOKEN','ALLOWED_CHAT_ID','DISCORD_BOT_TOKEN','DISCORD_ALLOWED_USER_ID','DISCORD_ALLOWED_CHANNEL_ID','CLAUDECLAW_CONFIG','ANTHROPIC_API_KEY','GROQ_API_KEY','ELEVENLABS_API_KEY','ELEVENLABS_VOICE_ID','GOOGLE_API_KEY','CLAUDE_CODE_OAUTH_TOKEN','WHATSAPP_ENABLED','WARROOM_ENABLED','DB_ENCRYPTION_KEY','DASHBOARD_TOKEN','DASHBOARD_PORT','DASHBOARD_URL','SECURITY_PIN_HASH','IDLE_LOCK_MINUTES','EMERGENCY_KILL_PHRASE','DESTRUCTIVE_CONFIRM']);
   for (const [k, v] of Object.entries(env)) {
     if (!known.has(k) && v) lines.push(`${k}=${v}`);
   }
@@ -1115,8 +1256,16 @@ async function main() {
   console.log(`  ${c.cyan}╚════════════════════════════════════════════╝${c.reset}`);
   console.log();
 
-  ok(`Bot: @${botUsername || '(configure TELEGRAM_BOT_TOKEN)'}`);
-  env.ALLOWED_CHAT_ID ? ok(`Chat ID: ${env.ALLOWED_CHAT_ID}`) : warn('Chat ID: not set (bot will tell you on first message)');
+  if (messengerChoice === 'discord') {
+    ok(`Bot: ${botUsername || '(configure DISCORD_BOT_TOKEN)'} (Discord)`);
+    env.DISCORD_ALLOWED_USER_ID
+      ? ok(`User ID: ${env.DISCORD_ALLOWED_USER_ID}`)
+      : warn('User ID: not set — bot will reject all messages');
+    if (env.DISCORD_ALLOWED_CHANNEL_ID) ok(`Channel ID: ${env.DISCORD_ALLOWED_CHANNEL_ID}`);
+  } else {
+    ok(`Bot: @${botUsername || '(configure TELEGRAM_BOT_TOKEN)'}`);
+    env.ALLOWED_CHAT_ID ? ok(`Chat ID: ${env.ALLOWED_CHAT_ID}`) : warn('Chat ID: not set (bot will tell you on first message)');
+  }
   env.ANTHROPIC_API_KEY ? ok('Claude: API key (pay-per-token)') : ok('Claude: Max plan subscription');
   wantVoiceIn && env.GROQ_API_KEY ? ok('Voice input: Groq Whisper ✓') : wantVoiceIn ? warn('Voice input: GROQ_API_KEY not set') : info('Voice input: not enabled');
   wantVoiceOut && env.ELEVENLABS_API_KEY ? ok('Voice output: ElevenLabs ✓') : wantVoiceOut ? warn('Voice output: ElevenLabs keys not set') : info('Voice output: not enabled');
@@ -1169,7 +1318,7 @@ async function main() {
     info('Logs: journalctl --user -u claudeclaw -f');
   }
   console.log();
-  info(`Prefer Signal instead of Telegram? Set ${c.cyan}MESSENGER_TYPE=signal${c.reset} in .env and follow ${c.cyan}docs/messengers/signal.md${c.reset}.`);
+  info(`Prefer Signal? Set ${c.cyan}MESSENGER_TYPE=signal${c.reset} in .env and follow ${c.cyan}docs/messengers/signal.md${c.reset}.`);
   console.log();
 }
 
