@@ -407,7 +407,84 @@ function createSchema(database: Database.Database): void {
       total_cost  REAL NOT NULL DEFAULT 0,
       created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
     );
+
+    -- Multi-user: identity + role + status. Keyed by (platform,
+    -- platform_user_id) so a future src/discord.ts slots in without a
+    -- schema migration. platform_user_id is chat.id for Telegram (stored
+    -- as text because chat IDs can exceed 2^31 on some clients).
+    CREATE TABLE IF NOT EXISTS users (
+      id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+      platform            TEXT NOT NULL DEFAULT 'telegram'
+                          CHECK (platform IN ('telegram','discord')),
+      platform_user_id    TEXT NOT NULL,
+      platform_username   TEXT,
+      display_name        TEXT NOT NULL,
+      role                TEXT NOT NULL
+                          CHECK (role IN ('owner','admin','staff','restricted')),
+      status              TEXT NOT NULL DEFAULT 'active'
+                          CHECK (status IN ('active','locked','pending')),
+      pin_hash            TEXT,
+      idle_lock_minutes   INTEGER,
+      dashboard_token     TEXT UNIQUE,
+      created_at          INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      created_by          INTEGER REFERENCES users(id),
+      last_active_at      INTEGER,
+      UNIQUE (platform, platform_user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_users_platform_lookup
+      ON users(platform, platform_user_id);
+    CREATE INDEX IF NOT EXISTS idx_users_dashboard_token
+      ON users(dashboard_token);
+
+    -- Multi-user: skills granted per user. Owner is implicitly granted
+    -- everything (no rows needed); the can() helper short-circuits on
+    -- role='owner'. Absence of a row = denied.
+    CREATE TABLE IF NOT EXISTS user_skills (
+      user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      skill_name  TEXT NOT NULL,
+      granted_by  INTEGER REFERENCES users(id),
+      granted_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      PRIMARY KEY (user_id, skill_name)
+    );
+
+    -- Multi-user: specialist-agent delegation rights.
+    CREATE TABLE IF NOT EXISTS user_agents (
+      user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      agent_id      TEXT NOT NULL,
+      can_delegate  INTEGER NOT NULL DEFAULT 1,
+      granted_by    INTEGER REFERENCES users(id),
+      granted_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      PRIMARY KEY (user_id, agent_id)
+    );
+
+    -- Multi-user: pending invites. Owner/admin generates a one-time
+    -- token via /invite; invitee redeems by sending /start <token>.
+    CREATE TABLE IF NOT EXISTS user_invites (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      token         TEXT NOT NULL UNIQUE,
+      invited_by    INTEGER NOT NULL REFERENCES users(id),
+      role          TEXT NOT NULL
+                    CHECK (role IN ('admin','staff','restricted')),
+      display_name  TEXT,
+      expires_at    INTEGER NOT NULL,
+      redeemed_at   INTEGER,
+      redeemed_by   INTEGER REFERENCES users(id),
+      created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_invites_token ON user_invites(token);
   `);
+}
+
+/**
+ * @internal — for src/users.ts and tests. Returns the live database
+ * handle so user-related queries can live in their own module without
+ * piping every helper through db.ts. Throws if the DB hasn't been
+ * initialised yet (mirrors how other helpers blow up on uninitialised
+ * access).
+ */
+export function _getDb(): Database.Database {
+  if (!db) throw new Error('Database not initialised. Call initDatabase() first.');
+  return db;
 }
 
 export function initDatabase(): void {
@@ -732,6 +809,45 @@ function runMigrations(database: Database.Database): void {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_convlog_warroom_assistant
       ON conversation_log(source, source_meeting_id, source_turn_id, agent_id)
       WHERE source != 'telegram' AND role = 'assistant';
+  `);
+
+  // ── Multi-user (v0.1.0) ────────────────────────────────────────────
+  // Add user_id to every per-chat table so each row carries the
+  // identity that owns it. Nullable for the migration window — an
+  // existing single-user install backfills via migrations/0.1.0/004 to
+  // the auto-promoted owner. Fresh installs start with NULLs that the
+  // application fills in as users are created.
+  addColumnIfMissing(database, 'sessions',          'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'memories',          'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'consolidations',    'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'scheduled_tasks',   'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'mission_tasks',     'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'conversation_log',  'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'token_usage',       'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'wa_message_map',    'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'wa_outbox',         'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'wa_messages',       'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'slack_messages',    'user_id', 'INTEGER REFERENCES users(id)');
+
+  // hive_mind + audit_log carry an *actor* user_id (who did the thing)
+  // and audit_log additionally a *target* user_id (who it was done to).
+  addColumnIfMissing(database, 'hive_mind', 'actor_user_id',  'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'audit_log', 'actor_user_id',  'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'audit_log', 'target_user_id', 'INTEGER REFERENCES users(id)');
+
+  // mission_tasks gets chat_id directly so the scheduler doesn't need to
+  // fall back to ALLOWED_CHAT_ID when a task fires (see scheduler.ts:151).
+  addColumnIfMissing(database, 'mission_tasks', 'chat_id', `TEXT NOT NULL DEFAULT ''`);
+
+  // Indexes for the new user-scoped query patterns.
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS idx_memories_user      ON memories(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_sched_user         ON scheduled_tasks(user_id, status, next_run);
+    CREATE INDEX IF NOT EXISTS idx_missions_user      ON mission_tasks(user_id, status, priority DESC, created_at ASC);
+    CREATE INDEX IF NOT EXISTS idx_convo_user         ON conversation_log(user_id, agent_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_token_usage_user   ON token_usage(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_hive_actor         ON hive_mind(actor_user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_actor        ON audit_log(actor_user_id, created_at DESC);
   `);
 }
 

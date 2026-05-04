@@ -1,4 +1,13 @@
 {
-  "migrations": {   
+  "migrations": {
+    "0.1.0": [
+      "001-create-users-table",
+      "002-promote-allowed-chat-id-to-owner",
+      "003-add-user-id-columns",
+      "004-backfill-user-id-to-owner",
+      "005-create-user-skills-and-agents",
+      "006-create-user-invites",
+      "007-add-mission-chat-id"
+    ]
   }
 }
