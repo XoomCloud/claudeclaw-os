@@ -2510,10 +2510,21 @@ export function insertAuditLog(
   action: string,
   detail: string,
   blocked: boolean,
+  opts: { actorUserId?: number; targetUserId?: number } = {},
 ): void {
   db.prepare(
-    `INSERT INTO audit_log (agent_id, chat_id, action, detail, blocked, created_at) VALUES (?, ?, ?, ?, ?, strftime('%s','now'))`,
-  ).run(agentId, chatId, action, detail.slice(0, 2000), blocked ? 1 : 0);
+    `INSERT INTO audit_log
+       (agent_id, chat_id, action, detail, blocked, actor_user_id, target_user_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))`,
+  ).run(
+    agentId,
+    chatId,
+    action,
+    detail.slice(0, 2000),
+    blocked ? 1 : 0,
+    opts.actorUserId ?? null,
+    opts.targetUserId ?? null,
+  );
 }
 
 export interface AuditLogEntry {

@@ -58,6 +58,13 @@ export function isSecurityEnabled(): boolean {
 }
 
 // ── PIN Lock ─────────────────────────────────────────────────────────
+//
+// Multi-user (v0.1.0): the legacy single-user vars below remain so
+// dashboard endpoints and the legacy /api/security/status keep working.
+// New code should use the per-user variants further down (isUserLocked,
+// lockUser, etc.) which key off the User row's pin_hash and
+// idle_lock_minutes columns. Lock state is kept in-process; bot
+// restarts re-lock anyone who has a PIN.
 
 let _locked = false;
 let _lastActivity = Date.now();
@@ -96,6 +103,117 @@ export function unlock(pin: string): boolean {
 /** Record activity to reset idle timeout. */
 export function touchActivity(): void {
   _lastActivity = Date.now();
+}
+
+// ── Per-user PIN lock (multi-user) ───────────────────────────────────
+//
+// One lock state per user. Initialised lazily on first access so the
+// bot doesn't have to enumerate every user at startup. The state
+// derives from the User row's `pin_hash` and `idle_lock_minutes`
+// columns; a user with no pin_hash is never locked.
+//
+// `EMERGENCY_KILL_PHRASE` stays global (one human triggering it tears
+// the install down — same blast radius as today, intentionally).
+
+interface UserLockState {
+  locked: boolean;
+  lastActivity: number;
+  pinHash: string | null;
+  idleLockMinutes: number;
+}
+
+interface SecurityUserView {
+  id: number;
+  pin_hash: string | null;
+  idle_lock_minutes: number | null;
+}
+
+const _userLockStates = new Map<number, UserLockState>();
+
+function getOrInit(user: SecurityUserView): UserLockState {
+  let state = _userLockStates.get(user.id);
+  if (!state) {
+    state = {
+      // Start locked iff the user has a PIN. Same first-run rule as
+      // the global single-user version above.
+      locked: !!user.pin_hash,
+      lastActivity: Date.now(),
+      pinHash: user.pin_hash,
+      idleLockMinutes: user.idle_lock_minutes ?? _idleLockMinutes,
+    };
+    _userLockStates.set(user.id, state);
+  } else if (state.pinHash !== user.pin_hash || state.idleLockMinutes !== (user.idle_lock_minutes ?? _idleLockMinutes)) {
+    // Pick up changes from /setpin or admin-driven overrides without
+    // requiring the lock entry to be invalidated separately.
+    state.pinHash = user.pin_hash;
+    state.idleLockMinutes = user.idle_lock_minutes ?? _idleLockMinutes;
+  }
+  return state;
+}
+
+export function userHasPin(user: SecurityUserView): boolean {
+  return !!user.pin_hash;
+}
+
+export function isUserLocked(user: SecurityUserView): boolean {
+  if (!user.pin_hash) return false;
+  const s = getOrInit(user);
+  if (!s.locked && s.idleLockMinutes > 0) {
+    const idleMs = Date.now() - s.lastActivity;
+    if (idleMs >= s.idleLockMinutes * 60 * 1000) {
+      s.locked = true;
+      logger.info({ userId: user.id }, 'Security: per-user session auto-locked (idle timeout)');
+    }
+  }
+  return s.locked;
+}
+
+export function lockUser(user: SecurityUserView): void {
+  if (!user.pin_hash) return;
+  const s = getOrInit(user);
+  s.locked = true;
+  logger.info({ userId: user.id }, 'Security: per-user session locked');
+}
+
+export function unlockUser(user: SecurityUserView, pin: string): boolean {
+  if (!user.pin_hash) return true; // no PIN configured = unlocked by default
+  if (verifyPin(pin, user.pin_hash)) {
+    const s = getOrInit(user);
+    s.locked = false;
+    s.lastActivity = Date.now();
+    logger.info({ userId: user.id }, 'Security: per-user session unlocked');
+    return true;
+  }
+  logger.warn({ userId: user.id }, 'Security: per-user incorrect PIN attempt');
+  return false;
+}
+
+export function touchUserActivity(user: SecurityUserView): void {
+  if (!user.pin_hash) return;
+  const s = getOrInit(user);
+  s.lastActivity = Date.now();
+}
+
+export function getUserSecurityStatus(user: SecurityUserView): {
+  pinEnabled: boolean;
+  locked: boolean;
+  idleLockMinutes: number;
+  killPhraseEnabled: boolean;
+  lastActivity: number;
+} {
+  const s = _userLockStates.get(user.id);
+  return {
+    pinEnabled: !!user.pin_hash,
+    locked: isUserLocked(user),
+    idleLockMinutes: user.idle_lock_minutes ?? _idleLockMinutes,
+    killPhraseEnabled: !!_killPhrase,
+    lastActivity: s?.lastActivity ?? 0,
+  };
+}
+
+/** @internal — for tests. Wipes per-user lock state. */
+export function _resetUserLockStates(): void {
+  _userLockStates.clear();
 }
 
 /**
@@ -186,7 +304,24 @@ export type AuditAction =
   | 'unlock'
   | 'lock'
   | 'kill'
-  | 'blocked';
+  | 'blocked'
+  // Multi-user identity events. Step 5 will route every /invite,
+  // /grant, /revoke, /role, /lockout, /handoff through audit() with
+  // these labels so the audit log doubles as the team activity feed.
+  | 'owner.bootstrap'
+  | 'invite.create'
+  | 'invite.redeem'
+  | 'role.change'
+  | 'lockout.set'
+  | 'lockout.clear'
+  | 'skill.grant'
+  | 'skill.revoke'
+  | 'agent.grant'
+  | 'agent.revoke'
+  | 'handoff'
+  | 'denied'
+  | 'denied.locked'
+  | 'denied.unauthorised';
 
 export interface AuditEntry {
   agentId: string;
@@ -194,6 +329,10 @@ export interface AuditEntry {
   action: AuditAction;
   detail: string;
   blocked: boolean;
+  /** Multi-user (v0.1.0): the user who performed the action. */
+  actorUserId?: number;
+  /** Multi-user: the user the action was performed on (role change, lockout, etc). */
+  targetUserId?: number;
 }
 
 let _auditCallback: ((entry: AuditEntry) => void) | null = null;

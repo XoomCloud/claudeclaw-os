@@ -43,16 +43,22 @@ import { messageQueue } from './message-queue.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
 import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from './state.js';
 import {
-  isLocked,
-  lock,
-  unlock,
-  touchActivity,
   checkKillPhrase,
   executeEmergencyKill,
-  isSecurityEnabled,
-  getSecurityStatus,
   audit,
+  isUserLocked,
+  lockUser,
+  unlockUser,
+  touchUserActivity,
+  userHasPin,
+  getUserSecurityStatus,
 } from './security.js';
+import {
+  resolveUser,
+  touchUserLastActive,
+  listUsers,
+  type User,
+} from './users.js';
 
 // ── Streaming rate limiter ───────────────────────────────────────────
 const globalStreamLastEdit = new Map<string, number>();
@@ -129,6 +135,18 @@ const AVAILABLE_MODELS: Record<string, string> = {
 };
 const DEFAULT_MODEL_LABEL = 'opus';
 
+/**
+ * Set the per-chat model override. Used by the dashboard's bulk
+ * model-change endpoint. Multi-user (v0.1.0) renamed from
+ * setMainModelOverride; the old name no longer makes sense once N
+ * humans share one bot. Each chat gets its own override.
+ */
+export function setModelOverride(chatId: string, model: string): void {
+  if (chatId) chatModelOverride.set(chatId, model);
+}
+
+/** @deprecated use setModelOverride(chatId, model). Kept for legacy
+ *  callers during the v0.1.0 migration window. Routes to the owner. */
 export function setMainModelOverride(model: string): void {
   if (ALLOWED_CHAT_ID) chatModelOverride.set(ALLOWED_CHAT_ID, model);
 }
@@ -328,38 +346,55 @@ async function sendTyping(api: Api<RawApi>, chatId: number): Promise<void> {
 }
 
 /**
- * Authorise the incoming chat against ALLOWED_CHAT_ID.
- * If ALLOWED_CHAT_ID is not yet configured, guide the user to set it up.
- * Returns true if the message should be processed.
+ * Resolve the incoming chat to a User row. Returns null when:
+ *   - the chat_id matches no user AND no bootstrap path applies (silent reject)
+ *   - the user exists but is locked-out (status='locked')
+ *
+ * Bootstrap path: if `users` is empty AND chat_id matches the legacy
+ * ALLOWED_CHAT_ID, we promote inline (auto-creates the owner row).
+ * This makes single-user installs that pulled new code without running
+ * migrations Just Work — first authenticated message creates the owner.
  */
-function isAuthorised(chatId: number): boolean {
-  if (!ALLOWED_CHAT_ID) {
-    // Not yet configured — let every request through but warn in the reply handler
-    return true;
-  }
-  return chatId.toString() === ALLOWED_CHAT_ID;
+function resolveAuthorisedUser(chatId: number): User | null {
+  const u = resolveUser(chatId, { legacyOwnerChatId: ALLOWED_CHAT_ID || undefined });
+  if (!u) return null;
+  if (u.status !== 'active') return null;
+  return u;
 }
 
 /**
- * Check auth + lock. Returns an error message if the command should be blocked, or null if OK.
- * Used by command handlers that should be gated behind both auth and PIN lock.
+ * One-line gate every command handler runs before doing work. Returns
+ * the User if the message should proceed, or null if the bot should
+ * silently drop. Lock state is checked here so a locked staff member
+ * can still type their PIN to unlock without bouncing past the gate.
+ *
+ * - When the user is unknown, returns null (caller silently drops or
+ *   routes to invite-redemption per `/start <token>`).
+ * - When the user is locked (status='locked'), returns null + audit row.
+ * - When the user has a PIN-locked session, returns null + audit row;
+ *   the text handler is responsible for trying `text` as a PIN.
  */
-function securityGate(ctx: Context): string | null {
-  if (!isAuthorised(ctx.chat!.id)) return 'unauthorized';
-  if (isLocked()) return 'locked';
-  touchActivity();
-  return null;
-}
-
-/** Reply with lock message and return true if locked, false if OK. */
-async function replyIfLocked(ctx: Context): Promise<boolean> {
-  const gate = securityGate(ctx);
-  if (gate === 'unauthorized') return true; // silently reject
-  if (gate === 'locked') {
-    await ctx.reply('Session locked. Send your PIN to unlock.');
-    return true;
+async function gateUser(
+  ctx: Context,
+  opts: { allowLockedSession?: boolean } = {},
+): Promise<User | null> {
+  const user = resolveAuthorisedUser(ctx.chat!.id);
+  if (!user) return null;
+  if (!opts.allowLockedSession && isUserLocked(user)) {
+    audit({
+      agentId: AGENT_ID,
+      chatId: String(ctx.chat!.id),
+      action: 'denied.locked',
+      detail: 'PIN-locked session, message rejected',
+      blocked: true,
+      actorUserId: user.id,
+    });
+    await ctx.reply('Session locked. Send your PIN to unlock.').catch(() => {});
+    return null;
   }
-  return false;
+  touchUserActivity(user);
+  touchUserLastActive(user.id);
+  return user;
 }
 
 /**
@@ -371,67 +406,82 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   const chatId = ctx.chat!.id;
   const chatIdStr = chatId.toString();
 
-  // Security gate
-  if (!isAuthorised(chatId)) {
+  // ── Resolve / bootstrap the User ───────────────────────────────
+  // Tries an existing users row first; if the table is empty AND the
+  // legacy ALLOWED_CHAT_ID matches, promotes inline (auto-creates the
+  // owner). Otherwise null = unknown chat, silent reject.
+  const wasEmpty = ALLOWED_CHAT_ID && chatIdStr === ALLOWED_CHAT_ID;
+  const user = resolveAuthorisedUser(chatId);
+  if (!user) {
+    audit({
+      agentId: AGENT_ID,
+      chatId: chatIdStr,
+      action: 'denied.unauthorised',
+      detail: 'No matching active user row',
+      blocked: true,
+    });
     logger.warn({ chatId }, 'Rejected message from unauthorised chat');
     return;
   }
-
-  // First-run setup: auto-save the chat ID and restart
-  if (!ALLOWED_CHAT_ID) {
-    const envPath = path.join(PROJECT_ROOT, '.env');
-    try {
-      let envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf-8') : '';
-      if (envContent.includes('ALLOWED_CHAT_ID=')) {
-        // Replace existing empty value
-        envContent = envContent.replace(/ALLOWED_CHAT_ID=.*/, `ALLOWED_CHAT_ID=${chatId}`);
-      } else {
-        // Append
-        envContent += `\nALLOWED_CHAT_ID=${chatId}\n`;
-      }
-      fs.writeFileSync(envPath, envContent);
-      await ctx.reply(
-        `Setup complete! Your chat ID (${chatId}) has been saved.\n\nRestarting now...`,
-      );
-      logger.info({ chatId }, 'Auto-saved ALLOWED_CHAT_ID to .env, restarting');
-      // Give Telegram a moment to deliver the message, then restart
-      setTimeout(() => process.exit(0), 1000);
-    } catch (err) {
-      logger.error({ err }, 'Could not auto-save chat ID');
-      await ctx.reply(
-        `Your chat ID is ${chatId}.\n\nI couldn't save it automatically. Open the .env file in your claudeclaw-os folder and add this line:\n\nALLOWED_CHAT_ID=${chatId}\n\nThen restart with: npm start`,
-      );
-    }
-    return;
+  if (wasEmpty && user.created_by === null) {
+    // First-run owner bootstrap path. Log this once so the operator
+    // sees their account got promoted from the legacy single-user
+    // setup. Reply is friendly to the brand-new user.
+    audit({
+      agentId: AGENT_ID,
+      chatId: chatIdStr,
+      action: 'owner.bootstrap',
+      detail: `Promoted chat ${chatIdStr} to owner from ALLOWED_CHAT_ID`,
+      blocked: false,
+      actorUserId: user.id,
+      targetUserId: user.id,
+    });
+    logger.info({ chatId, userId: user.id }, 'Promoted chat to owner inline');
   }
 
   // ── Emergency kill check (runs even when locked) ────────────────
   if (checkKillPhrase(message)) {
-    audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'kill', detail: 'Emergency kill triggered', blocked: false });
+    audit({
+      agentId: AGENT_ID, chatId: chatIdStr,
+      action: 'kill', detail: 'Emergency kill triggered',
+      blocked: false, actorUserId: user.id,
+    });
     await ctx.reply('EMERGENCY KILL activated. All agents stopping.');
     executeEmergencyKill();
     return;
   }
 
   // ── PIN lock check ─────────────────────────────────────────────
-  if (isLocked()) {
+  if (isUserLocked(user)) {
     // Try to unlock with the message as a PIN
-    if (unlock(message)) {
-      audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'unlock', detail: 'PIN accepted', blocked: false });
+    if (unlockUser(user, message)) {
+      audit({
+        agentId: AGENT_ID, chatId: chatIdStr,
+        action: 'unlock', detail: 'PIN accepted',
+        blocked: false, actorUserId: user.id,
+      });
       await ctx.reply('Unlocked. Session active.');
       return;
     }
-    // Wrong PIN or not a PIN
-    audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'blocked', detail: 'Session locked, message rejected', blocked: true });
+    audit({
+      agentId: AGENT_ID, chatId: chatIdStr,
+      action: 'blocked', detail: 'Session locked, message rejected',
+      blocked: true, actorUserId: user.id,
+    });
     await ctx.reply('Session locked. Send your PIN to unlock.');
     return;
   }
 
-  // Record activity for idle timer
-  touchActivity();
+  // Record activity for idle timer + last-active for the dashboard.
+  touchUserActivity(user);
+  touchUserLastActive(user.id);
 
   // Audit the incoming message
-  audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'message', detail: message.slice(0, 200), blocked: false });
+  audit({
+    agentId: AGENT_ID, chatId: chatIdStr,
+    action: 'message', detail: message.slice(0, 200),
+    blocked: false, actorUserId: user.id,
+  });
 
   logger.info(
     { chatId, messageLen: message.length },
@@ -833,6 +883,74 @@ function discoverSkillCommands(): Array<{ command: string; description: string }
   return commands.sort((a, b) => a.command.localeCompare(b.command));
 }
 
+// ── Per-user command menus (multi-user v0.1.0) ───────────────────────
+
+const BUILT_IN_COMMANDS: Array<{ command: string; description: string }> = [
+  { command: 'start',     description: 'Start the bot' },
+  { command: 'help',      description: 'Help — list available commands' },
+  { command: 'newchat',   description: 'Start a new Claude session' },
+  { command: 'respin',    description: 'Reload recent context' },
+  { command: 'voice',     description: 'Toggle voice mode on/off' },
+  { command: 'model',     description: 'Switch model (opus/sonnet/haiku)' },
+  { command: 'memory',    description: 'View recent memories' },
+  { command: 'forget',    description: 'Clear session' },
+  { command: 'wa',        description: 'Recent WhatsApp messages' },
+  { command: 'slack',     description: 'Recent Slack messages' },
+  { command: 'dashboard', description: 'Open web dashboard' },
+  { command: 'stop',      description: 'Stop current processing' },
+  { command: 'agents',    description: 'List available agents' },
+  { command: 'delegate',  description: 'Delegate task to agent' },
+  { command: 'lock',      description: 'Lock session (PIN required to unlock)' },
+  { command: 'status',    description: 'Show security status' },
+  { command: 'whoami',    description: 'Show your role and grants' },
+];
+
+/**
+ * Compute the visible command menu for a single user. Owner sees every
+ * skill on disk (implicit grant); everyone else sees only the skills
+ * they hold a row in `user_skills` for. The Telegram limit is 100
+ * commands per scope so we trim accordingly.
+ */
+export function commandsForUser(
+  user: User,
+  allSkillCommands: Array<{ command: string; description: string }>,
+): Array<{ command: string; description: string }> {
+  const visibleSkills =
+    user.role === 'owner'
+      ? allSkillCommands
+      : allSkillCommands.filter((c) => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { userHasSkill } = require('./users.js') as typeof import('./users.js');
+        return userHasSkill(user.id, c.command);
+      });
+  return [...BUILT_IN_COMMANDS, ...visibleSkills].slice(0, 100);
+}
+
+/**
+ * Push a fresh command menu to the user's Telegram chat. Called on
+ * bot start, on grant/revoke (step 5), and on role change (step 5).
+ * Best-effort — a stale chat_id just logs and continues.
+ */
+export async function refreshUserCommands(
+  api: Api<RawApi>,
+  user: User,
+  skillCommands?: Array<{ command: string; description: string }>,
+): Promise<void> {
+  if (user.platform !== 'telegram') return;
+  const chatId = parseInt(user.platform_user_id, 10);
+  if (!Number.isFinite(chatId)) {
+    logger.warn({ userId: user.id }, 'refreshUserCommands: non-numeric platform_user_id');
+    return;
+  }
+  const skills = skillCommands ?? discoverSkillCommands();
+  const commands = commandsForUser(user, skills);
+  try {
+    await api.setMyCommands(commands, { scope: { type: 'chat', chat_id: chatId } });
+  } catch (err) {
+    logger.warn({ err, userId: user.id }, 'refreshUserCommands: setMyCommands failed');
+  }
+}
+
 export function createBot(): Bot {
   const token = activeBotToken;
   if (!token) {
@@ -862,34 +980,44 @@ export function createBot(): Bot {
     });
   }
 
-  // Register commands in the Telegram menu (built-in + auto-discovered skills)
-  const builtInCommands = [
-    { command: 'start', description: 'Start the bot' },
-    { command: 'help', description: 'Help -- list available commands' },
-    { command: 'newchat', description: 'Start a new Claude session' },
-    { command: 'respin', description: 'Reload recent context' },
-    { command: 'voice', description: 'Toggle voice mode on/off' },
-    { command: 'model', description: 'Switch model (opus/sonnet/haiku)' },
-    { command: 'memory', description: 'View recent memories' },
-    { command: 'forget', description: 'Clear session' },
-    { command: 'wa', description: 'Recent WhatsApp messages' },
-    { command: 'slack', description: 'Recent Slack messages' },
-    { command: 'dashboard', description: 'Open web dashboard' },
-    { command: 'stop', description: 'Stop current processing' },
-    { command: 'agents', description: 'List available agents' },
-    { command: 'delegate', description: 'Delegate task to agent' },
-    { command: 'lock', description: 'Lock session (requires PIN to unlock)' },
-    { command: 'status', description: 'Show security status' },
-  ];
+  // Multi-user (v0.1.0): per-chat command menus.
+  //
+  // Each user's chat sees only the commands they're allowed to use:
+  // built-ins + their granted skills. Owner sees every skill on disk
+  // even without explicit user_skills rows (implicit grant).
+  //
+  // Default menu for unauthenticated chats shows only /chatid so a
+  // brand-new install or invitee can find their chat ID without seeing
+  // a misleading list of commands they can't actually run.
   const skillCommands = discoverSkillCommands();
-  const allCommands = [...builtInCommands, ...skillCommands].slice(0, 100); // Telegram limit: 100 commands
-  bot.api.setMyCommands(allCommands)
-    .then(() => logger.info({ count: skillCommands.length }, 'Registered %d skill commands with Telegram', skillCommands.length))
-    .catch((err) => logger.warn({ err }, 'Failed to register bot commands with Telegram'));
+  bot.api.setMyCommands([{ command: 'chatid', description: 'Get your chat ID' }])
+    .then(() => logger.info('Registered default (unauthenticated) command menu'))
+    .catch((err) => logger.warn({ err }, 'Failed to register default bot commands'));
+
+  // Re-broadcast per-chat menus for every active user. Errors are
+  // logged but not fatal — a stale chat_id will just fail this one
+  // call.
+  void (async () => {
+    try {
+      const activeUsers = listUsers({ status: 'active' }).filter(
+        (u) => u.platform === 'telegram',
+      );
+      for (const u of activeUsers) {
+        await refreshUserCommands(bot.api, u, skillCommands);
+      }
+      logger.info(
+        { users: activeUsers.length, skills: skillCommands.length },
+        'Registered per-chat command menus',
+      );
+    } catch (err) {
+      logger.warn({ err }, 'Per-chat command menu broadcast failed');
+    }
+  })();
 
   // /help — list available commands
-  bot.command('help', (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
+  bot.command('help', async (ctx) => {
+    const user = resolveAuthorisedUser(ctx.chat!.id);
+    if (!user) return;
     return ctx.reply(
       'ClaudeClaw — Commands\n\n' +
       '/newchat — Start a new Claude session\n' +
@@ -911,17 +1039,27 @@ export function createBot(): Bot {
     );
   });
 
-  // /chatid — get the chat ID (used during first-time setup)
-  // Responds to anyone only when ALLOWED_CHAT_ID is not yet configured.
-  // /chatid — only responds when ALLOWED_CHAT_ID is not yet configured (first-time setup)
+  // /chatid — get the chat ID (used during first-time setup, or by any
+  // authenticated user who needs to know their own ID).
   bot.command('chatid', (ctx) => {
-    if (ALLOWED_CHAT_ID) return; // Already configured — don't respond to anyone
-    return ctx.reply(`Your chat ID: ${ctx.chat!.id}`);
+    const user = resolveAuthorisedUser(ctx.chat!.id);
+    // Open the gate when the install has no users yet (very-first-run
+    // before owner is bootstrapped) so the wizard / setup script can
+    // see the chat ID. Otherwise only authenticated users get a reply.
+    const owners = listUsers({ role: 'owner' });
+    if (owners.length === 0 || user) {
+      return ctx.reply(`Your chat ID: ${ctx.chat!.id}`);
+    }
+    return; // unknown chat, install already provisioned — silent reject
   });
 
-  // /start — simple greeting (auth-gated after setup)
-  bot.command('start', (ctx) => {
-    if (ALLOWED_CHAT_ID && !isAuthorised(ctx.chat!.id)) return;
+  // /start — greeting + invite-token redemption.
+  // If the user sends `/start <token>` and the token is a valid invite,
+  // they're enrolled into the team with the role the inviter chose.
+  // (Token redemption itself ships in step 5; this hook is the seam.)
+  bot.command('start', async (ctx) => {
+    const user = resolveAuthorisedUser(ctx.chat!.id);
+    if (!user) return;
     if (AGENT_ID !== 'main') {
       return ctx.reply(`${AGENT_ID.charAt(0).toUpperCase() + AGENT_ID.slice(1)} agent online.`);
     }
@@ -930,7 +1068,8 @@ export function createBot(): Bot {
 
   // /newchat — clear Claude session, start fresh + auto-commit to hive mind
   bot.command('newchat', async (ctx) => {
-    if (await replyIfLocked(ctx)) return;
+    const user = await gateUser(ctx);
+    if (!user) return;
     const chatIdStr = ctx.chat!.id.toString();
     const oldSessionId = getSession(chatIdStr, AGENT_ID);
 
@@ -986,7 +1125,8 @@ export function createBot(): Bot {
 
   // /respin — after /newchat, pull recent conversation back as context
   bot.command('respin', async (ctx) => {
-    if (await replyIfLocked(ctx)) return;
+    const user = await gateUser(ctx);
+    if (!user) return;
     const chatIdStr = ctx.chat!.id.toString();
 
     // Pull the last 20 turns (10 back-and-forth exchanges) from conversation_log.
@@ -1015,7 +1155,8 @@ export function createBot(): Bot {
 
   // /voice — toggle voice mode for this chat
   bot.command('voice', async (ctx) => {
-    if (await replyIfLocked(ctx)) return;
+    const user = await gateUser(ctx);
+    if (!user) return;
     const caps = voiceCapabilities();
     if (!caps.tts) {
       await ctx.reply('No TTS provider configured. Add ElevenLabs, Gradium, or install ffmpeg for macOS say fallback.');
@@ -1033,7 +1174,8 @@ export function createBot(): Bot {
 
   // /model — switch Claude model (opus, sonnet, haiku)
   bot.command('model', async (ctx) => {
-    if (await replyIfLocked(ctx)) return;
+    const user = await gateUser(ctx);
+    if (!user) return;
     const chatIdStr = ctx.chat!.id.toString();
     const arg = ctx.match?.trim().toLowerCase();
 
@@ -1065,7 +1207,8 @@ export function createBot(): Bot {
 
   // /memory — show recent memories for this chat
   bot.command('memory', async (ctx) => {
-    if (await replyIfLocked(ctx)) return;
+    const user = await gateUser(ctx);
+    if (!user) return;
     const chatId = ctx.chat!.id.toString();
     const recent = getRecentMemories(chatId, 10);
     if (recent.length === 0) {
@@ -1083,7 +1226,8 @@ export function createBot(): Bot {
 
   // /pin <id> — make a memory permanent (never decays)
   bot.command('pin', async (ctx) => {
-    if (await replyIfLocked(ctx)) return;
+    const user = await gateUser(ctx);
+    if (!user) return;
     const id = parseInt(ctx.match?.trim() || '', 10);
     if (isNaN(id)) {
       await ctx.reply('Usage: /pin <memory_id>\n\nUse /memory to see recent IDs.');
@@ -1095,7 +1239,8 @@ export function createBot(): Bot {
 
   // /unpin <id> — remove permanent flag, memory will decay normally
   bot.command('unpin', async (ctx) => {
-    if (await replyIfLocked(ctx)) return;
+    const user = await gateUser(ctx);
+    if (!user) return;
     const id = parseInt(ctx.match?.trim() || '', 10);
     if (isNaN(id)) {
       await ctx.reply('Usage: /unpin <memory_id>');
@@ -1107,7 +1252,8 @@ export function createBot(): Bot {
 
   // /forget — clear session (memory decay handles the rest)
   bot.command('forget', async (ctx) => {
-    if (await replyIfLocked(ctx)) return;
+    const user = await gateUser(ctx);
+    if (!user) return;
     clearSession(ctx.chat!.id.toString(), AGENT_ID);
     await ctx.reply('Session cleared. Memories will fade naturally over time.');
   });
@@ -1115,7 +1261,8 @@ export function createBot(): Bot {
   // /wa — pull recent WhatsApp chats on demand
   bot.command('wa', async (ctx) => {
     const chatIdStr = ctx.chat!.id.toString();
-    if (await replyIfLocked(ctx)) return;
+    const user = await gateUser(ctx);
+    if (!user) return;
 
     try {
       const chats = await getWaChats(5);
@@ -1148,7 +1295,8 @@ export function createBot(): Bot {
   // /slack — pull recent Slack conversations on demand
   bot.command('slack', async (ctx) => {
     const chatIdStr = ctx.chat!.id.toString();
-    if (await replyIfLocked(ctx)) return;
+    const user = await gateUser(ctx);
+    if (!user) return;
 
     try {
       await sendTyping(ctx.api, ctx.chat!.id);
@@ -1181,16 +1329,23 @@ export function createBot(): Bot {
     }
   });
 
-  // /dashboard — send a clickable link to the web dashboard
+  // /dashboard — send a clickable link to the web dashboard.
+  // Multi-user (v0.1.0): each user gets a per-user link with their
+  // own dashboard_token. The legacy DASHBOARD_TOKEN is only used as a
+  // fallback for the auto-promoted owner that doesn't yet have a
+  // per-user token (set by migration 002, but a fresh in-memory test
+  // user will still need this fallback).
   bot.command('dashboard', async (ctx) => {
-    if (await replyIfLocked(ctx)) return;
-    if (!DASHBOARD_TOKEN) {
-      await ctx.reply('Dashboard not configured. Set DASHBOARD_TOKEN in .env and restart.');
+    const user = await gateUser(ctx);
+    if (!user) return;
+    const token = user.dashboard_token || DASHBOARD_TOKEN;
+    if (!token) {
+      await ctx.reply('Dashboard not configured. Ask an admin to set a dashboard token for your account.');
       return;
     }
     const chatIdStr = ctx.chat!.id.toString();
     const base = DASHBOARD_URL || `http://localhost:${DASHBOARD_PORT}`;
-    const url = `${base}/?token=${DASHBOARD_TOKEN}&chatId=${chatIdStr}`;
+    const url = `${base}/?token=${token}&chatId=${chatIdStr}`;
 
     const { InlineKeyboard } = await import('grammy');
     const keyboard = new InlineKeyboard().url('Open Dashboard', url);
@@ -1199,7 +1354,8 @@ export function createBot(): Bot {
 
   // /stop — interrupt the current agent query
   bot.command('stop', async (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
+    const user = resolveAuthorisedUser(ctx.chat!.id);
+    if (!user) return;
     const chatIdStr = ctx.chat!.id.toString();
     const aborted = abortActiveQuery(chatIdStr);
     if (aborted) {
@@ -1211,42 +1367,70 @@ export function createBot(): Bot {
 
   // /agents — list available agents for delegation
   bot.command('agents', async (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
+    const user = resolveAuthorisedUser(ctx.chat!.id);
+    if (!user) return;
     const agents = getAvailableAgents();
     if (agents.length === 0) {
       await ctx.reply('No agents configured. Add agent configs under agents/ directory.');
       return;
     }
-    const lines = agents.map((a) => `<b>${a.id}</b> — ${a.description || '(no description)'}`).join('\n');
+    // Multi-user (v0.1.0): non-owner users see only the agents they
+    // can delegate to. Owner sees everything. The 'main' agent is
+    // shown to staff/admin always; restricted users only see explicit
+    // grants. Step 5 will add /grant + /revoke commands; this query
+    // already reflects whatever was set by other paths.
+    const visibleAgents = user.role === 'owner'
+      ? agents
+      : agents.filter((a) => {
+        if (a.id === 'main' && user.role !== 'restricted') return true;
+        // Defer to userCanDelegate which checks user_agents.
+        // Imported lazily-via-static so we don't need the agent grant
+        // helper hoisted at the top.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { userCanDelegate } = require('./users.js') as typeof import('./users.js');
+        return userCanDelegate(user.id, a.id);
+      });
+    if (visibleAgents.length === 0) {
+      await ctx.reply('No specialist agents available. Ask an admin to grant access.');
+      return;
+    }
+    const lines = visibleAgents.map((a) => `<b>${a.id}</b> — ${a.description || '(no description)'}`).join('\n');
     await ctx.reply(
       `<b>Available agents</b>\n\n${lines}\n\n<i>Usage: @agentId: prompt or /delegate agentId prompt</i>`,
       { parse_mode: 'HTML' },
     );
   });
 
-  // /lock — manually lock the session
+  // /lock — manually lock the session (per-user)
   bot.command('lock', async (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
-    if (!isSecurityEnabled()) {
-      await ctx.reply('PIN lock not configured. Set SECURITY_PIN_HASH in .env to enable.');
+    const user = resolveAuthorisedUser(ctx.chat!.id);
+    if (!user) return;
+    if (!userHasPin(user)) {
+      await ctx.reply('PIN lock not configured. Use /setpin to enable.');
       return;
     }
-    lock();
-    audit({ agentId: AGENT_ID, chatId: ctx.chat!.id.toString(), action: 'lock', detail: 'Manual lock via /lock', blocked: false });
+    lockUser(user);
+    audit({
+      agentId: AGENT_ID, chatId: ctx.chat!.id.toString(),
+      action: 'lock', detail: 'Manual lock via /lock',
+      blocked: false, actorUserId: user.id,
+    });
     await ctx.reply('Session locked. Send your PIN to unlock.');
   });
 
-  // /status — show security status
+  // /status — show per-user security status
   bot.command('status', async (ctx) => {
-    if (!isAuthorised(ctx.chat!.id)) return;
-    const s = getSecurityStatus();
+    const user = resolveAuthorisedUser(ctx.chat!.id);
+    if (!user) return;
+    const s = getUserSecurityStatus(user);
     const lines = [
       `PIN lock: ${s.pinEnabled ? 'enabled' : 'disabled'}`,
       `Session: ${s.locked ? 'LOCKED' : 'unlocked'}`,
       s.idleLockMinutes > 0 ? `Idle lock: ${s.idleLockMinutes}m` : 'Idle lock: disabled',
       `Kill phrase: ${s.killPhraseEnabled ? 'configured' : 'disabled'}`,
+      `Role: ${user.role}`,
     ];
-    if (!s.locked && s.pinEnabled) {
+    if (!s.locked && s.pinEnabled && s.lastActivity > 0) {
       const idleSec = Math.round((Date.now() - s.lastActivity) / 1000);
       lines.push(`Last activity: ${idleSec < 60 ? idleSec + 's ago' : Math.round(idleSec / 60) + 'm ago'}`);
     }
@@ -1257,7 +1441,8 @@ export function createBot(): Bot {
   // This command is intercepted by handleMessage's parseDelegation(),
   // but we register it so grammY doesn't pass it to the text handler.
   bot.command('delegate', async (ctx) => {
-    if (await replyIfLocked(ctx)) return;
+    const user = await gateUser(ctx);
+    if (!user) return;
     const args = ctx.match?.trim();
     if (!args) {
       const agents = getAvailableAgents();
@@ -1283,24 +1468,52 @@ export function createBot(): Bot {
       if (OWN_COMMANDS.has(cmd)) return; // already handled by bot.command() above
     }
 
-    // ── Security: kill phrase + lock check (before any state machines) ──
+    // ── Resolve user (so kill / unlock / activity audit have actor) ──
+    // Unauthorised chats: silent reject (audit row written by handleMessage
+    // path if they reach it; for the text state-machine path we just bail
+    // here without audit since we don't yet know which user this is).
+    const textUser = resolveAuthorisedUser(ctx.chat!.id);
+
+    // Kill phrase works even for unknown users — same blast radius as
+    // today (anyone who knows the phrase can trip the kill switch).
     if (checkKillPhrase(text)) {
-      audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'kill', detail: 'Emergency kill via text handler', blocked: false });
+      audit({
+        agentId: AGENT_ID, chatId: chatIdStr,
+        action: 'kill', detail: 'Emergency kill via text handler',
+        blocked: false, actorUserId: textUser?.id,
+      });
       await ctx.reply('EMERGENCY KILL activated. All agents stopping.');
       executeEmergencyKill();
       return;
     }
-    if (isLocked()) {
-      if (unlock(text)) {
-        audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'unlock', detail: 'PIN accepted', blocked: false });
+
+    if (!textUser) {
+      // Unknown chat. Drop without auditing every random ping; the
+      // handleMessage gate audits it once below.
+      return;
+    }
+
+    // PIN unlock path: text matches user's PIN → unlock; else stay locked.
+    if (isUserLocked(textUser)) {
+      if (unlockUser(textUser, text)) {
+        audit({
+          agentId: AGENT_ID, chatId: chatIdStr,
+          action: 'unlock', detail: 'PIN accepted',
+          blocked: false, actorUserId: textUser.id,
+        });
         await ctx.reply('Unlocked. Session active.');
       } else {
-        audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'blocked', detail: 'Session locked, wrong PIN or message rejected', blocked: true });
+        audit({
+          agentId: AGENT_ID, chatId: chatIdStr,
+          action: 'blocked', detail: 'Session locked, wrong PIN or message rejected',
+          blocked: true, actorUserId: textUser.id,
+        });
         await ctx.reply('Session locked. Send your PIN to unlock.');
       }
       return;
     }
-    touchActivity();
+    touchUserActivity(textUser);
+    touchUserLastActive(textUser.id);
 
     // ── WhatsApp state machine ──────────────────────────────────────
     const state = waState.get(chatIdStr);
@@ -1463,15 +1676,8 @@ export function createBot(): Bot {
       await ctx.reply('Voice transcription not configured. Add GROQ_API_KEY to .env');
       return;
     }
-    const chatId = ctx.chat!.id;
-    if (!isAuthorised(chatId)) return;
-    if (!ALLOWED_CHAT_ID) {
-      await ctx.reply(
-        `Your chat ID is ${chatId}.\n\nAdd this to your .env:\n\nALLOWED_CHAT_ID=${chatId}\n\nThen restart ClaudeClaw OS.`,
-      );
-      return;
-    }
-
+    const user = resolveAuthorisedUser(ctx.chat!.id);
+    if (!user) return;
     try {
       const fileId = ctx.message.voice.file_id;
       const localPath = await downloadTelegramFile(activeBotToken, fileId, UPLOADS_DIR);
@@ -1488,20 +1694,13 @@ export function createBot(): Bot {
 
   // Photos — download and pass to Claude
   bot.on('message:photo', async (ctx) => {
-    const chatId = ctx.chat!.id;
-    if (!isAuthorised(chatId)) return;
-    if (!ALLOWED_CHAT_ID) {
-      await ctx.reply(
-        `Your chat ID is ${chatId}.\n\nAdd this to your .env:\n\nALLOWED_CHAT_ID=${chatId}\n\nThen restart ClaudeClaw OS.`,
-      );
-      return;
-    }
-
+    const user = resolveAuthorisedUser(ctx.chat!.id);
+    if (!user) return;
     try {
       const photo = ctx.message.photo[ctx.message.photo.length - 1];
       const localPath = await downloadMedia(activeBotToken, photo.file_id, 'photo.jpg');
       const msg = buildPhotoMessage(localPath, ctx.message.caption ?? undefined);
-      const chatIdStr = chatId.toString();
+      const chatIdStr = ctx.chat!.id.toString();
       messageQueue.enqueue(chatIdStr, () => handleMessage(ctx, msg));
     } catch (err) {
       logger.error({ err }, 'Photo download failed');
@@ -1511,21 +1710,14 @@ export function createBot(): Bot {
 
   // Documents — download and pass to Claude
   bot.on('message:document', async (ctx) => {
-    const chatId = ctx.chat!.id;
-    if (!isAuthorised(chatId)) return;
-    if (!ALLOWED_CHAT_ID) {
-      await ctx.reply(
-        `Your chat ID is ${chatId}.\n\nAdd this to your .env:\n\nALLOWED_CHAT_ID=${chatId}\n\nThen restart ClaudeClaw OS.`,
-      );
-      return;
-    }
-
+    const user = resolveAuthorisedUser(ctx.chat!.id);
+    if (!user) return;
     try {
       const doc = ctx.message.document;
       const filename = doc.file_name ?? 'file';
       const localPath = await downloadMedia(activeBotToken, doc.file_id, filename);
       const msg = buildDocumentMessage(localPath, filename, ctx.message.caption ?? undefined);
-      const chatIdStr = chatId.toString();
+      const chatIdStr = ctx.chat!.id.toString();
       messageQueue.enqueue(chatIdStr, () => handleMessage(ctx, msg));
     } catch (err) {
       logger.error({ err }, 'Document download failed');
@@ -1535,19 +1727,14 @@ export function createBot(): Bot {
 
   // Videos — download and pass to Claude for Gemini analysis
   bot.on('message:video', async (ctx) => {
-    const chatId = ctx.chat!.id;
-    if (!isAuthorised(chatId)) return;
-    if (!ALLOWED_CHAT_ID) {
-      await ctx.reply(`Your chat ID is ${chatId}.\n\nAdd this to your .env:\n\nALLOWED_CHAT_ID=${chatId}\n\nThen restart ClaudeClaw OS.`);
-      return;
-    }
-
+    const user = resolveAuthorisedUser(ctx.chat!.id);
+    if (!user) return;
     try {
       const video = ctx.message.video;
       const filename = video.file_name ?? `video_${Date.now()}.mp4`;
       const localPath = await downloadMedia(activeBotToken, video.file_id, filename);
       const msg = buildVideoMessage(localPath, ctx.message.caption ?? undefined);
-      const chatIdStr = chatId.toString();
+      const chatIdStr = ctx.chat!.id.toString();
       messageQueue.enqueue(chatIdStr, () => handleMessage(ctx, msg));
     } catch (err) {
       logger.error({ err }, 'Video download failed');
@@ -1557,19 +1744,14 @@ export function createBot(): Bot {
 
   // Video notes (circular format) — download and pass to Claude for Gemini analysis
   bot.on('message:video_note', async (ctx) => {
-    const chatId = ctx.chat!.id;
-    if (!isAuthorised(chatId)) return;
-    if (!ALLOWED_CHAT_ID) {
-      await ctx.reply(`Your chat ID is ${chatId}.\n\nAdd this to your .env:\n\nALLOWED_CHAT_ID=${chatId}\n\nThen restart ClaudeClaw OS.`);
-      return;
-    }
-
+    const user = resolveAuthorisedUser(ctx.chat!.id);
+    if (!user) return;
     try {
       const videoNote = ctx.message.video_note;
       const filename = `video_note_${Date.now()}.mp4`;
       const localPath = await downloadMedia(activeBotToken, videoNote.file_id, filename);
       const msg = buildVideoMessage(localPath, undefined);
-      const chatIdStr = chatId.toString();
+      const chatIdStr = ctx.chat!.id.toString();
       messageQueue.enqueue(chatIdStr, () => handleMessage(ctx, msg));
     } catch (err) {
       logger.error({ err }, 'Video note download failed');
@@ -1593,12 +1775,16 @@ export function createBot(): Bot {
 export async function processMessageFromDashboard(
   botApi: Api<RawApi>,
   text: string,
+  opts: { chatId?: string } = {},
 ): Promise<void> {
-  if (!ALLOWED_CHAT_ID) return;
+  // Multi-user (v0.1.0): callers (the dashboard) supply chatId derived
+  // from the authenticated user's row. Falls back to the legacy
+  // ALLOWED_CHAT_ID for the migration window where the dashboard
+  // hasn't been updated yet (step 7).
+  const chatIdStr = opts.chatId || ALLOWED_CHAT_ID;
+  if (!chatIdStr) return;
 
-  const chatIdStr = ALLOWED_CHAT_ID;
-
-  logger.info({ messageLen: text.length, source: 'dashboard' }, 'Processing dashboard message');
+  logger.info({ messageLen: text.length, source: 'dashboard', chatId: chatIdStr }, 'Processing dashboard message');
 
   // Route through the message queue so dashboard messages wait for any
   // in-flight Telegram message or scheduled task to finish first.
