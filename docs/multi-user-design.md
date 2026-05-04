@@ -1,8 +1,24 @@
 # Multi-User Support — Design Doc
 
-Status: **draft for review**. No code has been written yet. Stops here for sign-off.
+Status: **approved, ready for implementation**. All 13 open questions resolved (see §16). Next step is schema + migrations + `src/users.ts`.
 
 Targets a single ClaudeClaw OS install supporting 2–20 humans on one machine, one DB, one bot per agent (existing model). Backwards compatible with today's single-user `.env`-driven install: an existing user's bot keeps working with zero config change after migration.
+
+## Resolutions log (decisions locked in 2026-05-04)
+
+1. **Topology:** one bot per agent. Per-user allow/deny via `users.status` + `/lockout`/`/unlockout`.
+2. **`mission_tasks.chat_id`:** new column added.
+3. **Owner skill grants:** implicit (owner row, no `user_skills` rows; accessor short-circuits for `role='owner'`).
+4. **`bypassPermissions`:** stays true for all authenticated users. Skill/agent grants are the primary control.
+5. **Per-user PIN:** each user can `/setpin`. Owner PIN required for `/handoff` — prompted to set inline if missing.
+6. **`restricted` role:** strict. A fresh `restricted` user has zero capabilities; admin must explicitly grant `agent.delegate:main`, every skill, etc.
+7. **Dashboard `?onBehalfOf=<userId>`:** allowed for owner, audit row written each use.
+8. **Migration version:** `0.1.0`.
+9. **`last_active_at`:** updated on every authenticated message.
+10. **`wa_message_map` PK:** unchanged.
+11. **PIN lock:** per-user (`Map<userId, LockState>`). `EMERGENCY_KILL_PHRASE` stays global.
+12. **Rate tracker:** stays global. `actor_user_id` recorded per event for attribution.
+13. **Discord:** deferred to a follow-up PR. This PR ships the abstraction so Discord slots in cleanly: the `users` table is keyed by `(platform, platform_user_id)` instead of `telegram_chat_id`, with `platform='telegram'` for every row created in this round. See §5.1.
 
 ---
 
@@ -102,10 +118,16 @@ All migrations are **additive**, every column has a sensible default so existing
 
 ```sql
 -- Single source of truth for user identity, role, status, lock state.
+-- Keyed by (platform, platform_user_id) so Discord can be added later
+-- without a schema migration. For Telegram, platform_user_id is the
+-- chat.id (numeric, stored as text). For Discord (future), it'll be
+-- the Discord user ID.
 CREATE TABLE users (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-  telegram_chat_id    TEXT NOT NULL UNIQUE,
-  telegram_username   TEXT,                              -- for display + @-mention resolution
+  platform            TEXT NOT NULL DEFAULT 'telegram'
+                      CHECK (platform IN ('telegram','discord')),
+  platform_user_id    TEXT NOT NULL,                     -- chat_id for telegram
+  platform_username   TEXT,                              -- @handle (telegram) or username#1234 (discord)
   display_name        TEXT NOT NULL,
   role                TEXT NOT NULL CHECK (role IN ('owner','admin','staff','restricted')),
   status              TEXT NOT NULL DEFAULT 'active'
@@ -115,9 +137,10 @@ CREATE TABLE users (
   dashboard_token     TEXT UNIQUE,                       -- per-user dashboard auth token
   created_at          INTEGER NOT NULL DEFAULT (strftime('%s','now')),
   created_by          INTEGER REFERENCES users(id),      -- NULL for the owner
-  last_active_at      INTEGER
+  last_active_at      INTEGER,
+  UNIQUE (platform, platform_user_id)
 );
-CREATE INDEX idx_users_chat_id ON users(telegram_chat_id);
+CREATE INDEX idx_users_platform_lookup ON users(platform, platform_user_id);
 CREATE INDEX idx_users_dashboard_token ON users(dashboard_token);
 
 -- Skills granted to each user. Presence = allowed; absence = denied.
@@ -193,9 +216,9 @@ CREATE INDEX idx_audit_actor        ON audit_log(actor_user_id, created_at DESC)
 
 ### 5.3 Why both `chat_id` AND `user_id`?
 
-Keeping both is deliberate. `chat_id` is the Telegram-side join key — every inbound message brings a chat_id, sessions are keyed by it (`sessions(chat_id, agent_id)`), and memories use it for retrieval scoping. Replacing it with `user_id` would force every retrieval site to do an extra lookup. Keeping both lets us (a) leave existing chat-keyed queries alone for performance, (b) handle the rare case where a user's `telegram_chat_id` changes (e.g. account migration) without losing their data, and (c) keep the per-chat-id session resumption semantics that Claude Code's SDK expects.
+Keeping both is deliberate. `chat_id` is the per-platform join key — every inbound message brings a chat_id, sessions are keyed by it (`sessions(chat_id, agent_id)`), and memories use it for retrieval scoping. Replacing it with `user_id` would force every retrieval site to do an extra lookup. Keeping both lets us (a) leave existing chat-keyed queries alone for performance, (b) handle the rare case where a user's `platform_user_id` changes (e.g. account migration) without losing their data, (c) keep the per-chat-id session resumption semantics that Claude Code's SDK expects, and (d) gives Discord a clean attach point later — a Discord row in `users` will have its own `platform_user_id` and per-platform `chat_id`-keyed history won't conflict.
 
-The relationship is `users.telegram_chat_id` UNIQUE → 1:1 today, but if a user's chat_id ever changes we update the users row and all `chat_id`-keyed historical rows continue to belong to that user via their `user_id`.
+The relationship is `users.(platform, platform_user_id)` UNIQUE → 1:1 today. If a Discord row is later created for the same human, it'll be a separate `users.id`; mapping a single human across platforms is a future feature (not in scope this round).
 
 ### 5.4 Schema changes for `mission_tasks`
 
@@ -251,7 +274,9 @@ Flow on first start after upgrade:
 2. **`npm run migrate`** runs `0.1.0/001-create-users-table` etc.
 3. **`002-promote-allowed-chat-id-to-owner`**: reads `.env` → if `ALLOWED_CHAT_ID` is set AND `users` table is empty, INSERT a row:
    ```
-   role='owner', status='active', telegram_chat_id=<env value>,
+   role='owner', status='active',
+   platform='telegram',
+   platform_user_id=<ALLOWED_CHAT_ID>,
    display_name=<env username if known else "Owner">,
    created_by=NULL,
    pin_hash=<copy from SECURITY_PIN_HASH>,
@@ -591,35 +616,35 @@ After every step in the implementation plan, the existing test suite plus new te
 
 ---
 
-## 16. Open questions for review
+## 16. Open questions — RESOLVED
 
-These are the decisions I want explicit thumbs-up on before writing any code.
+All 13 resolved 2026-05-04. Live answers next to each question; design body has been updated to match.
 
-1. **Bot topology.** Confirming the recommendation: keep one bot per agent, each routing N humans by chat_id. (Alternative: one bot per human per agent — explicitly rejected as operationally awful.)
+1. **Bot topology.** → ✅ **RESOLVED: one bot per agent, N humans routed by chat_id.** Per-user allow/deny via `users.status` + `/lockout`/`/unlockout`. (Alternative: one bot per human per agent — explicitly rejected as operationally awful.)
 
-2. **`mission_tasks` getting `chat_id`.** I'm proposing this column gets added (not just `user_id`). It removes the only remaining `ALLOWED_CHAT_ID` fallback in `src/scheduler.ts`. OK?
+2. **`mission_tasks` getting `chat_id`.** → ✅ **RESOLVED: add the column.** Removes the last `ALLOWED_CHAT_ID` fallback in `src/scheduler.ts`.
 
-3. **Owner skill grants implicit?** Plan: owner row has no `user_skills` rows because they have everything. `getSkillsForUser(owner)` returns the full registry. Alternative: insert one `user_skills` row per skill at promotion time. The implicit version is cleaner; the explicit version makes audit trail more uniform. I lean **implicit** unless you'd rather see explicit.
+3. **Owner skill grants implicit?** → ✅ **RESOLVED: implicit.** Owner row has no `user_skills` rows; `userHasSkill(user, *)` short-circuits to `true` when `user.role === 'owner'`. New skills installed later become available to owner without a backfill.
 
-4. **`bypassPermissions` for non-owner users.** Confirmed in safety rule: don't touch. So staff/restricted users still run the SDK with full bypass after authentication. Skill/agent grants are the primary control. Documented in §11. **Confirm this is acceptable for a 2–20 person trusted team** — if not, we need a separate design pass on per-role tool allowlisting, which is a much bigger change.
+4. **`bypassPermissions` for non-owner users.** → ✅ **RESOLVED: stays true.** Staff/restricted users run the SDK with full bypass after authentication. Skill/agent grants are the primary control. Documented in §11. Acceptable for a 2–20 person trusted team.
 
-5. **Per-user PIN.** Spec says "optional per-user PIN." I'll implement it as: each user can `/setpin <new>` to set/change their own; admin can force a reset; owner's PIN is required for `/handoff`. OK to require PIN on handoff even if owner never set one (we'd prompt them to set one first)?
+5. **Per-user PIN, prompt-to-set on handoff.** → ✅ **RESOLVED.** Each user can `/setpin <new>`. Admin can force a reset. Owner's PIN is required for `/handoff`; if owner never set one, the handoff flow prompts them to set it inline first.
 
-6. **Restricted role definition.** I'm reading "restricted" as "explicit-grant for everything, including basic chat with the main agent." So a fresh `restricted` user can do nothing by default; admin grants them `agent.delegate:main` and skills one by one. Confirm this matches what you want, vs a softer "restricted = staff minus skill grants" interpretation.
+6. **Restricted role definition.** → ✅ **RESOLVED: STRICT.** A fresh `restricted` user has zero capabilities. Admin must explicitly grant `agent.delegate:main` AND every individual skill. Soft interpretation rejected because it duplicates `staff` with empty `user_skills`.
 
-7. **Dashboard `?onBehalfOf`** for owner support actions on staff data. I propose owner can append `?onBehalfOf=<userId>` to any `/api/memories`-class endpoint to view that user's data, with an audit row written every time. OK or do you want this strictly behind a separate `/api/team/users/:id/memories` route?
+7. **Dashboard `?onBehalfOf`.** → ✅ **RESOLVED: allowed for owner, audit row each use.** Owner can append `?onBehalfOf=<userId>` to any `/api/memories`-class endpoint; the handler emits an `audit_log` row tagged `dashboard.onBehalfOf` with `actor_user_id=owner` and `target_user_id=<userId>`.
 
-8. **Migration version bump.** I want to land this as `0.1.0` (the first real entry in `migrations/version.json`). Today the registry is empty. Confirm this version label is fine or you want `0.0.1` etc.
+8. **Migration version bump.** → ✅ **RESOLVED: `0.1.0`.**
 
-9. **Per-user `last_active_at`.** Updated on every authenticated message? Cheap (one UPDATE). Alternative is a debounced update every 60s. I lean every-message — it's a single indexed UPDATE, no cost worth optimising.
+9. **Per-user `last_active_at`.** → ✅ **RESOLVED: every authenticated message.** Single indexed UPDATE per turn.
 
-10. **Existing `wa_message_map` PK.** Today it's `telegram_msg_id` only. Adding `user_id` doesn't conflict with the PK but means two users replying to the same telegram message could collide. In practice each user has their own outbound msg_ids per chat so this is fine. Flagging for the record.
+10. **Existing `wa_message_map` PK.** → ✅ **RESOLVED: PK unchanged.** `telegram_msg_id` stays as the sole PK. Flagged for the record.
 
-11. **Per-user PIN lock vs global.** Confirming the §10b decision: lock state moves from process-global to per-user (`Map<userId, LockState>`). One user locking does not lock everyone. The existing `EMERGENCY_KILL_PHRASE` stays global — a kill phrase from anyone tears the install down (same blast radius as today, intentionally).
+11. **Per-user PIN lock vs global.** → ✅ **RESOLVED: per-user.** Lock state moves from process-global to `Map<userId, LockState>`. One user `/lock`-ing does not lock everyone. `EMERGENCY_KILL_PHRASE` stays global.
 
-12. **Rate tracker stays global.** Daily cost / hourly token budgets remain process-wide. We record `actor_user_id` per event for attribution but the limit enforcement is one bucket. Sound, or do you want per-user budgets in this round?
+12. **Rate tracker stays global.** → ✅ **RESOLVED.** Daily cost / hourly token budgets remain one process-wide bucket. `actor_user_id` recorded per event for attribution. Per-user budgets out of scope this round.
 
-13. **WhatsApp/Slack bridges stay singleton.** Out of scope for this iteration. WA incoming notifications continue to route to owner. Confirming this is acceptable.
+13. **Discord access.** → ⏸️ **DEFERRED to a follow-up PR.** This PR ships the abstraction so Discord slots in cleanly: `users` keyed by `(platform, platform_user_id)` UNIQUE pair (§5.1), `platform='telegram'` for every row created in this round. Adding Discord later is a transport-only change (new `src/discord.ts` mirroring `src/bot.ts`); no schema migration required.
 
 ---
 
@@ -627,8 +652,8 @@ These are the decisions I want explicit thumbs-up on before writing any code.
 
 Mirrors the steps in the user's request; each phase ends with `npm run typecheck && npm test && npm run build` green and a separate commit so any phase can be reverted independently.
 
-1. **Plan only** — this doc. Stop here for review. (current step)
-2. Schema + migrations + `src/users.ts` + tests.
+1. **Plan only** — this doc. ✅ DONE — all 13 questions resolved.
+2. Schema + migrations + `src/users.ts` + tests. ← **next step**
 3. Bot wiring: `resolveUser`, per-user audit fields, per-chat command menus.
 4. Downstream: `agent.ts`, `scheduler.ts`, `memory.ts`, `orchestrator.ts`, per-user CLAUDE.md.
 5. New commands: `/invite`, `/users`, `/grant`, `/revoke`, `/role`, `/whoami`, `/lockout`, `/handoff`.
