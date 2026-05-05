@@ -400,9 +400,15 @@ describe('GET /api/security/status', () => {
 });
 
 describe('GET /api/chat/history', () => {
-  it('rejects missing chatId with 400', async () => {
+  it('returns { turns: [] } when chatId is missing (graceful default)', async () => {
+    // Handler graceful-defaults to {turns: []} when neither ?chatId nor
+    // ALLOWED_CHAT_ID is set, so the dashboard doesn't surface a 400 in
+    // the chat overlay on first paint. See the in-line comment on the
+    // handler in dashboard.ts for the rationale.
     const res = await get('/api/chat/history');
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(200);
+    const body = await jsonOf(res);
+    expect(body).toMatchObject({ turns: [] });
   });
 
   it('returns { turns: [] } with chatId', async () => {
