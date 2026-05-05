@@ -60,6 +60,7 @@ import {
   type User,
 } from './users.js';
 import { resolveUserCwd } from './user-config.js';
+import { registerTeamCommands, tryHandoffPin, tryRedeemInvite } from './bot-team-commands.js';
 
 // ── Streaming rate limiter ───────────────────────────────────────────
 const globalStreamLastEdit = new Map<string, number>();
@@ -895,7 +896,21 @@ function discoverSkillCommands(): Array<{ command: string; description: string }
 
 // ── Per-user command menus (multi-user v0.1.0) ───────────────────────
 
-const BUILT_IN_COMMANDS: Array<{ command: string; description: string }> = [
+interface MenuCommand {
+  command: string;
+  description: string;
+  /** Minimum role to show in the menu. Defaults to 'restricted' (everyone). */
+  minRole?: User['role'];
+}
+
+const ROLE_RANK: Record<User['role'], number> = {
+  owner: 3,
+  admin: 2,
+  staff: 1,
+  restricted: 0,
+};
+
+const BUILT_IN_COMMANDS: MenuCommand[] = [
   { command: 'start',     description: 'Start the bot' },
   { command: 'help',      description: 'Help — list available commands' },
   { command: 'newchat',   description: 'Start a new Claude session' },
@@ -913,18 +928,36 @@ const BUILT_IN_COMMANDS: Array<{ command: string; description: string }> = [
   { command: 'lock',      description: 'Lock session (PIN required to unlock)' },
   { command: 'status',    description: 'Show security status' },
   { command: 'whoami',    description: 'Show your role and grants' },
+  { command: 'setpin',    description: 'Set or change your PIN' },
+  { command: 'users',     description: 'List team members' },
+  // Owner + admin: team management.
+  { command: 'invite',    description: 'Invite a new team member',           minRole: 'admin' },
+  { command: 'grant',     description: 'Grant a skill to a user',            minRole: 'admin' },
+  { command: 'revoke',    description: 'Revoke a skill from a user',         minRole: 'admin' },
+  { command: 'role',      description: 'Change a user role',                 minRole: 'admin' },
+  { command: 'lockout',   description: 'Lock out a user',                    minRole: 'admin' },
+  { command: 'unlockout', description: 'Reactivate a locked-out user',       minRole: 'admin' },
+  // Owner only.
+  { command: 'handoff',   description: 'Transfer ownership (PIN required)',  minRole: 'owner' },
 ];
 
 /**
  * Compute the visible command menu for a single user. Owner sees every
  * skill on disk (implicit grant); everyone else sees only the skills
- * they hold a row in `user_skills` for. The Telegram limit is 100
- * commands per scope so we trim accordingly.
+ * they hold a row in `user_skills` for. Built-in commands are
+ * filtered by minRole so staff don't see `/invite` etc. The Telegram
+ * limit is 100 commands per scope so we trim accordingly.
  */
 export function commandsForUser(
   user: User,
   allSkillCommands: Array<{ command: string; description: string }>,
 ): Array<{ command: string; description: string }> {
+  const userRank = ROLE_RANK[user.role];
+  const visibleBuiltIns = BUILT_IN_COMMANDS.filter((c) => {
+    if (!c.minRole) return true;
+    return userRank >= ROLE_RANK[c.minRole];
+  }).map(({ command, description }) => ({ command, description }));
+
   const visibleSkills =
     user.role === 'owner'
       ? allSkillCommands
@@ -933,7 +966,7 @@ export function commandsForUser(
         const { userHasSkill } = require('./users.js') as typeof import('./users.js');
         return userHasSkill(user.id, c.command);
       });
-  return [...BUILT_IN_COMMANDS, ...visibleSkills].slice(0, 100);
+  return [...visibleBuiltIns, ...visibleSkills].slice(0, 100);
 }
 
 /**
@@ -1063,11 +1096,12 @@ export function createBot(): Bot {
     return; // unknown chat, install already provisioned — silent reject
   });
 
-  // /start — greeting + invite-token redemption.
-  // If the user sends `/start <token>` and the token is a valid invite,
-  // they're enrolled into the team with the role the inviter chose.
-  // (Token redemption itself ships in step 5; this hook is the seam.)
+  // /start [<token>] — greeting OR invite redemption.
+  // Token-form is open to anyone (the user is by definition not yet
+  // authenticated when redeeming); plain /start is auth-gated.
   bot.command('start', async (ctx) => {
+    const tokenRedeemed = await tryRedeemInvite(ctx);
+    if (tokenRedeemed) return;
     const user = resolveAuthorisedUser(ctx.chat!.id);
     if (!user) return;
     if (AGENT_ID !== 'main') {
@@ -1075,6 +1109,9 @@ export function createBot(): Bot {
     }
     return ctx.reply('ClaudeClaw online. What do you need?');
   });
+
+  // Multi-user (v0.1.0): team management commands.
+  registerTeamCommands(bot);
 
   // /newchat — clear Claude session, start fresh + auto-commit to hive mind
   bot.command('newchat', async (ctx) => {
@@ -1468,7 +1505,14 @@ export function createBot(): Bot {
   });
 
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/memory', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/lock', '/status']);
+  const OWN_COMMANDS = new Set([
+    '/start', '/help', '/newchat', '/respin', '/voice', '/model', '/memory',
+    '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard',
+    '/stop', '/agents', '/delegate', '/lock', '/status',
+    // Multi-user (v0.1.0)
+    '/whoami', '/setpin', '/users', '/invite', '/grant', '/revoke', '/role',
+    '/lockout', '/unlockout', '/handoff',
+  ]);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();
@@ -1500,6 +1544,14 @@ export function createBot(): Bot {
     if (!textUser) {
       // Unknown chat. Drop without auditing every random ping; the
       // handleMessage gate audits it once below.
+      return;
+    }
+
+    // Multi-user (v0.1.0): pending /handoff intercept — runs BEFORE
+    // the lock check so the owner doesn't have to unlock just to
+    // confirm a handoff. tryHandoffPin returns true if the message
+    // was consumed (PIN match, mismatch, or timeout) so we bail.
+    if (await tryHandoffPin(chatIdStr, text, textUser, ctx)) {
       return;
     }
 
