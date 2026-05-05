@@ -23,18 +23,51 @@ import {
   resumeScheduledTask,
 } from './db.js';
 import { computeNextRun } from './scheduler.js';
+import { getOwner, getUserById, getUserByPlatformId, getUserByUsername } from './users.js';
 
 initDatabase();
 
-// Parse --agent flag from anywhere in argv, fall back to CLAUDECLAW_AGENT_ID env var
-const agentFlagIdx = process.argv.indexOf('--agent');
-const cliAgentId = agentFlagIdx !== -1
-  ? process.argv[agentFlagIdx + 1] ?? 'main'
-  : process.env.CLAUDECLAW_AGENT_ID ?? 'main';
-// Remove --agent and its value from rest args (only filter when flag is present)
-const cleanedArgv = agentFlagIdx !== -1
-  ? process.argv.filter((_, i) => i !== agentFlagIdx && i !== agentFlagIdx + 1)
-  : [...process.argv];
+/** Parse a flag with its value from argv. Returns the value and a list
+ *  of indices to strip. When the flag isn't present, value is null. */
+function takeFlag(argv: string[], name: string): { value: string | null; strip: number[] } {
+  const idx = argv.indexOf(name);
+  if (idx === -1) return { value: null, strip: [] };
+  return { value: argv[idx + 1] ?? null, strip: [idx, idx + 1] };
+}
+
+const agent = takeFlag(process.argv, '--agent');
+const userArg = takeFlag(process.argv, '--user');
+const cliAgentId = agent.value ?? process.env.CLAUDECLAW_AGENT_ID ?? 'main';
+
+// Multi-user (v0.1.0): --user accepts either a numeric chat id, a
+// numeric user_id, or a @username. Defaults to CLAUDECLAW_USER_ID env
+// var, then to the auto-promoted owner. Single-user installs without
+// any users at all just get user_id=null on the row, which is fine —
+// the scheduler resolveTaskOwner falls back to ALLOWED_CHAT_ID.
+function resolveCliUserId(arg: string | null | undefined): number | undefined {
+  const raw = arg ?? process.env.CLAUDECLAW_USER_ID;
+  if (raw) {
+    const trimmed = raw.startsWith('@') ? raw : raw.trim();
+    if (/^\d+$/.test(trimmed)) {
+      // Numeric: try platform_user_id (chat id) first, then internal user_id.
+      const byChat = getUserByPlatformId('telegram', trimmed);
+      if (byChat) return byChat.id;
+      const byId = getUserById(parseInt(trimmed, 10));
+      if (byId) return byId.id;
+    } else {
+      const byUsername = getUserByUsername('telegram', trimmed);
+      if (byUsername) return byUsername.id;
+    }
+    console.error(`--user "${raw}" did not match any user. Falling back to owner.`);
+  }
+  const owner = getOwner();
+  return owner?.id;
+}
+
+const cliUserId = resolveCliUserId(userArg.value);
+
+const stripIndices = new Set<number>([...agent.strip, ...userArg.strip]);
+const cleanedArgv = process.argv.filter((_, i) => !stripIndices.has(i));
 const [, , command, ...rest] = cleanedArgv;
 
 function formatDate(unix: number | null): string {
@@ -66,10 +99,11 @@ switch (command) {
     }
 
     const id = randomBytes(4).toString('hex');
-    createScheduledTask(id, prompt, cron, nextRun, cliAgentId);
+    createScheduledTask(id, prompt, cron, nextRun, cliAgentId, cliUserId);
 
     console.log(`Task created: ${id}`);
     console.log(`Agent:        ${cliAgentId}`);
+    if (cliUserId) console.log(`User:         #${cliUserId}`);
     console.log(`Prompt:       ${prompt}`);
     console.log(`Schedule:     ${cron}`);
     console.log(`Next run:     ${formatDate(nextRun)}`);

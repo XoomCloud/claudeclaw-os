@@ -59,6 +59,7 @@ import {
   listUsers,
   type User,
 } from './users.js';
+import { resolveUserCwd } from './user-config.js';
 
 // ── Streaming rate limiter ───────────────────────────────────────────
 const globalStreamLastEdit = new Map<string, number>();
@@ -507,6 +508,8 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
           emitChatEvent({ type: 'progress', chatId: chatIdStr, description: progressMsg });
           void ctx.reply(progressMsg).catch(() => {});
         },
+        undefined,
+        user,
       );
 
       const response = delegationResult.text?.trim() || 'Agent completed with no output.';
@@ -515,7 +518,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       if (!skipLog) {
         // Attribute to the delegated agent, not the caller, so memories
         // created from this conversation are tagged with the correct agent.
-        saveConversationTurn(chatIdStr, delegation.prompt, response, undefined, delegation.agentId);
+        saveConversationTurn(chatIdStr, delegation.prompt, response, undefined, delegation.agentId, user.id);
       }
       emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: response, source: 'telegram' });
 
@@ -643,6 +646,11 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       }
     } : undefined;
 
+    // Per-user CLAUDE.md: when this user has a personal users/<chat_id>/
+    // CLAUDE.md, point the SDK at it. Falls through to the agent's
+    // CLAUDE.md when no per-user file exists (today's behavior).
+    const userCwd = resolveUserCwd(chatIdStr) ?? undefined;
+
     const result = await runAgentWithRetry(
       fullMessage,
       sessionId,
@@ -656,6 +664,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       },
       MODEL_FALLBACK_CHAIN.length > 0 ? MODEL_FALLBACK_CHAIN : undefined,
       agentMcpAllowlist,
+      userCwd,
     );
 
     clearTimeout(timeoutId);
@@ -709,7 +718,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     // Save conversation turn to memory (including full log).
     // Skip logging for synthetic messages like /respin to avoid self-referential growth.
     if (!skipLog) {
-      saveConversationTurn(chatIdStr, message, rawResponse, result.newSessionId ?? sessionId, AGENT_ID);
+      saveConversationTurn(chatIdStr, message, rawResponse, result.newSessionId ?? sessionId, AGENT_ID, user.id);
       // Fire-and-forget: evaluate which surfaced memories were useful
       if (surfacedMemoryIds.length > 0) {
         void evaluateMemoryRelevance(surfacedMemoryIds, surfacedMemorySummaries, message, rawResponse).catch(() => {});
@@ -778,6 +787,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
           result.usage.totalCostUsd,
           result.usage.didCompact,
           AGENT_ID,
+          user.id,
         );
       } catch (dbErr) {
         logger.error({ err: dbErr }, 'Failed to save token usage');
@@ -1799,6 +1809,14 @@ async function processDashboardMessage(
   emitChatEvent({ type: 'user_message', chatId: chatIdStr, content: text, source: 'dashboard' });
   setProcessing(chatIdStr, true);
 
+  // Multi-user (v0.1.0): map the chat back to a User row so the
+  // resulting conversation_log + token_usage rows are owned by the
+  // right human. NULL when the dashboard hits a chat that doesn't
+  // belong to any user — back-compat for the migration window.
+  const dashUser = resolveUser(chatIdStr, { legacyOwnerChatId: ALLOWED_CHAT_ID || undefined });
+  const dashUserId = dashUser?.id;
+  const dashUserCwd = resolveUserCwd(chatIdStr) ?? undefined;
+
   try {
     const sessionId = getSession(chatIdStr, AGENT_ID);
 
@@ -1839,6 +1857,7 @@ async function processDashboardMessage(
       abortCtrl,
       undefined, // no streaming for dashboard
       agentMcpAllowlist,
+      dashUserCwd,
     );
 
     clearTimeout(dashTimeout);
@@ -1860,7 +1879,7 @@ async function processDashboardMessage(
     const rawResponse = result.text?.trim() || 'Done.';
 
     // Save conversation turn
-    saveConversationTurn(chatIdStr, text, rawResponse, result.newSessionId ?? sessionId, AGENT_ID);
+    saveConversationTurn(chatIdStr, text, rawResponse, result.newSessionId ?? sessionId, AGENT_ID, dashUserId);
     if (dashSurfacedIds.length > 0) {
       void evaluateMemoryRelevance(dashSurfacedIds, dashSummaries, text, rawResponse).catch(() => {});
     }
@@ -1937,6 +1956,7 @@ async function processDashboardMessage(
           result.usage.totalCostUsd,
           result.usage.didCompact,
           AGENT_ID,
+          dashUserId,
         );
       } catch (dbErr) {
         logger.error({ err: dbErr }, 'Failed to save token usage');

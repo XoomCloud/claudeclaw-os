@@ -21,6 +21,7 @@ import {
   getMissionTask,
   cancelMissionTask,
 } from './db.js';
+import { getOwner, getUserById, getUserByPlatformId, getUserByUsername } from './users.js';
 
 initDatabase();
 
@@ -48,12 +49,41 @@ const priorityArg = priorityFlagIdx !== -1
   ? parseInt(process.argv[priorityFlagIdx + 1] ?? '0', 10)
   : 5;
 
+// Multi-user (v0.1.0): --user identifies which human owns the task.
+// Accepts a chat_id, internal user_id, or @username. Defaults to
+// CLAUDECLAW_USER_ID env var, then to the auto-promoted owner. Single-
+// user installs without any users get user_id=null, which the
+// scheduler's resolveTaskOwner falls back to ALLOWED_CHAT_ID for.
+const userFlagIdx = process.argv.indexOf('--user');
+const userArg = userFlagIdx !== -1 ? (process.argv[userFlagIdx + 1] ?? null) : null;
+
+function resolveCliUser(arg: string | null | undefined): { userId: number | undefined; chatId: string } {
+  const raw = arg ?? process.env.CLAUDECLAW_USER_ID;
+  if (raw) {
+    const trimmed = raw.startsWith('@') ? raw : raw.trim();
+    if (/^\d+$/.test(trimmed)) {
+      const byChat = getUserByPlatformId('telegram', trimmed);
+      if (byChat) return { userId: byChat.id, chatId: byChat.platform_user_id };
+      const byId = getUserById(parseInt(trimmed, 10));
+      if (byId) return { userId: byId.id, chatId: byId.platform_user_id };
+    } else {
+      const byUsername = getUserByUsername('telegram', trimmed);
+      if (byUsername) return { userId: byUsername.id, chatId: byUsername.platform_user_id };
+    }
+    console.error(`--user "${raw}" did not match any user. Falling back to owner.`);
+  }
+  const owner = getOwner();
+  return { userId: owner?.id, chatId: owner?.platform_user_id ?? '' };
+}
+
+const cliUser = resolveCliUser(userArg);
+
 // Who created this task
 const createdBy = process.env.CLAUDECLAW_AGENT_ID ?? 'main';
 
 // Clean argv: remove all flag pairs
 const flagIndices = new Set<number>();
-[agentFlagIdx, titleFlagIdx, statusFlagIdx, priorityFlagIdx].forEach(idx => {
+[agentFlagIdx, titleFlagIdx, statusFlagIdx, priorityFlagIdx, userFlagIdx].forEach(idx => {
   if (idx !== -1) { flagIndices.add(idx); flagIndices.add(idx + 1); }
 });
 const cleanedArgv = process.argv.filter((_, i) => !flagIndices.has(i));
@@ -76,11 +106,15 @@ switch (command) {
     }
     const title = titleArg || prompt.slice(0, 60);
     const id = randomBytes(4).toString('hex');
-    createMissionTask(id, title, prompt, targetAgent ?? null, createdBy, priorityArg);
+    createMissionTask(
+      id, title, prompt, targetAgent ?? null, createdBy, priorityArg,
+      cliUser.userId, cliUser.chatId,
+    );
 
     console.log(`Mission task created: ${id}`);
     console.log(`  Title:    ${title}`);
     console.log(`  Agent:    ${targetAgent || 'unassigned (use dashboard to assign)'}`);
+    if (cliUser.userId) console.log(`  User:     #${cliUser.userId} (chat ${cliUser.chatId})`);
     console.log(`  Priority: ${priorityArg}`);
     console.log(`  Prompt:   ${prompt.slice(0, 100)}${prompt.length > 100 ? '...' : ''}`);
     break;

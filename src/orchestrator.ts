@@ -8,6 +8,8 @@ import { PROJECT_ROOT } from './config.js';
 import { logToHiveMind, createInterAgentTask, completeInterAgentTask } from './db.js';
 import { logger } from './logger.js';
 import { buildMemoryContext } from './memory.js';
+import { resolveUserCwd } from './user-config.js';
+import { can, PermissionDeniedError, type User } from './users.js';
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -140,7 +142,16 @@ export async function delegateToAgent(
   fromAgent: string,
   onProgress?: (msg: string) => void,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  /** Multi-user (v0.1.0): the human who triggered the delegation.
+   *  When supplied, can() gates whether they can delegate to this
+   *  specialist agent at all. When omitted, behaves as before
+   *  (back-compat for war-room and any caller without identity). */
+  actor?: User,
 ): Promise<DelegationResult> {
+  if (actor && !can(actor, 'agent.delegate', { kind: 'agent', agent: agentId })) {
+    throw new PermissionDeniedError(actor, 'agent.delegate', `agent=${agentId}`);
+  }
+
   let agent = agentRegistry.find((a) => a.id === agentId);
   if (!agent) {
     // Cache miss: an agent created via the dashboard wizard after this
@@ -165,6 +176,8 @@ export async function delegateToAgent(
     chatId,
     'delegate',
     `Delegated to ${agentId}: ${prompt.slice(0, 100)}`,
+    undefined,
+    actor?.id,
   );
 
   onProgress?.(`Delegating to ${agent.name}...`);
@@ -200,6 +213,11 @@ export async function delegateToAgent(
     const abortCtrl = new AbortController();
     const timer = setTimeout(() => abortCtrl.abort(), timeoutMs);
 
+    // Per-user CLAUDE.md applies to delegation too — the actor's
+    // CLAUDE.md still wins over the delegated agent's, mirroring how
+    // a normal handleMessage call resolves cwd.
+    const userCwd = chatId ? (resolveUserCwd(chatId) ?? undefined) : undefined;
+
     try {
       const result = await runAgent(
         fullPrompt,
@@ -210,6 +228,7 @@ export async function delegateToAgent(
         abortCtrl,
         undefined, // no streaming for delegation
         agentConfig.mcpServers,
+        userCwd,
       );
 
       clearTimeout(timer);
@@ -221,6 +240,8 @@ export async function delegateToAgent(
         chatId,
         'delegate_result',
         `Completed delegation from ${fromAgent}: ${(result.text ?? '').slice(0, 120)}`,
+        undefined,
+        actor?.id,
       );
 
       onProgress?.(
@@ -247,6 +268,8 @@ export async function delegateToAgent(
       chatId,
       'delegate_error',
       `Delegation from ${fromAgent} failed: ${errMsg.slice(0, 120)}`,
+      undefined,
+      actor?.id,
     );
     throw err;
   }

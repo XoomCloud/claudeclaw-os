@@ -929,11 +929,12 @@ export function saveStructuredMemory(
   importance: number,
   source = 'conversation',
   agentId = 'main',
+  userId?: number,
 ): number {
   const now = Math.floor(Date.now() / 1000);
   const result = db.prepare(
-    `INSERT INTO memories (chat_id, source, raw_text, summary, entities, topics, importance, agent_id, created_at, accessed_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO memories (chat_id, source, raw_text, summary, entities, topics, importance, agent_id, user_id, created_at, accessed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     chatId,
     source,
@@ -943,6 +944,7 @@ export function saveStructuredMemory(
     JSON.stringify(topics),
     importance,
     agentId,
+    userId ?? null,
     now,
     now,
   );
@@ -1089,9 +1091,10 @@ export function saveStructuredMemoryAtomic(
   embedding: number[],
   source = 'conversation',
   agentId = 'main',
+  userId?: number,
 ): number {
   const txn = db.transaction(() => {
-    const memoryId = saveStructuredMemory(chatId, rawText, summary, entities, topics, importance, source, agentId);
+    const memoryId = saveStructuredMemory(chatId, rawText, summary, entities, topics, importance, source, agentId, userId);
     if (embedding.length > 0) {
       saveMemoryEmbedding(memoryId, embedding);
     }
@@ -1357,12 +1360,13 @@ export function createScheduledTask(
   schedule: string,
   nextRun: number,
   agentId = 'main',
+  userId?: number,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO scheduled_tasks (id, prompt, schedule, next_run, status, created_at, agent_id)
-     VALUES (?, ?, ?, ?, 'active', ?, ?)`,
-  ).run(id, prompt, schedule, nextRun, now, agentId);
+    `INSERT INTO scheduled_tasks (id, prompt, schedule, next_run, status, created_at, agent_id, user_id)
+     VALUES (?, ?, ?, ?, 'active', ?, ?, ?)`,
+  ).run(id, prompt, schedule, nextRun, now, agentId, userId ?? null);
 }
 
 export function getDueTasks(agentId = 'main'): ScheduledTask[] {
@@ -1590,12 +1594,13 @@ export function logConversationTurn(
   content: string,
   sessionId?: string,
   agentId = 'main',
+  userId?: number,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO conversation_log (chat_id, session_id, role, content, created_at, agent_id)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(chatId, sessionId ?? null, role, content, now, agentId);
+    `INSERT INTO conversation_log (chat_id, session_id, role, content, created_at, agent_id, user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(chatId, sessionId ?? null, role, content, now, agentId, userId ?? null);
 }
 
 export function getRecentConversation(
@@ -1846,12 +1851,13 @@ export function saveTokenUsage(
   costUsd: number,
   didCompact: boolean,
   agentId = 'main',
+  userId?: number,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO token_usage (chat_id, session_id, input_tokens, output_tokens, cache_read, context_tokens, cost_usd, did_compact, created_at, agent_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(chatId, sessionId ?? null, inputTokens, outputTokens, cacheRead, contextTokens, costUsd, didCompact ? 1 : 0, now, agentId);
+    `INSERT INTO token_usage (chat_id, session_id, input_tokens, output_tokens, cache_read, context_tokens, cost_usd, did_compact, created_at, agent_id, user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(chatId, sessionId ?? null, inputTokens, outputTokens, cacheRead, contextTokens, costUsd, didCompact ? 1 : 0, now, agentId, userId ?? null);
 }
 
 export interface SessionTokenSummary {
@@ -2081,12 +2087,16 @@ export function logToHiveMind(
   action: string,
   summary: string,
   artifacts?: string,
+  /** Multi-user (v0.1.0): the human whose action triggered this hive
+   *  entry. Powers the per-role hive feed scoping (staff sees own;
+   *  admin sees team; owner sees all). */
+  actorUserId?: number,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO hive_mind (agent_id, chat_id, action, summary, artifacts, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(agentId, chatId, action, summary, artifacts ?? null, now);
+    `INSERT INTO hive_mind (agent_id, chat_id, action, summary, artifacts, created_at, actor_user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(agentId, chatId, action, summary, artifacts ?? null, now, actorUserId ?? null);
 }
 
 export function getHiveMindEntries(limit = 20, agentId?: string): HiveMindEntry[] {
@@ -2275,6 +2285,13 @@ export interface MissionTask {
   created_at: number;
   started_at: number | null;
   completed_at: number | null;
+  /** Multi-user (v0.1.0): owner of the task. NULL for legacy rows
+   *  created before migration; backfilled to owner.id by migration 004. */
+  user_id: number | null;
+  /** Multi-user (v0.1.0): chat to route the result back to. Empty
+   *  string for legacy rows; scheduler falls back to ALLOWED_CHAT_ID
+   *  in that case. */
+  chat_id: string;
 }
 
 export function createMissionTask(
@@ -2284,12 +2301,17 @@ export function createMissionTask(
   assignedAgent: string | null = null,
   createdBy = 'dashboard',
   priority = 0,
+  /** Multi-user (v0.1.0): identity of the human who queued the task. */
+  userId?: number,
+  /** Multi-user (v0.1.0): chat the result should land in. Removes the
+   *  ALLOWED_CHAT_ID fallback in scheduler.ts:151. */
+  chatId?: string,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO mission_tasks (id, title, prompt, assigned_agent, status, created_by, priority, created_at)
-     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)`,
-  ).run(id, title, prompt, assignedAgent, createdBy, priority, now);
+    `INSERT INTO mission_tasks (id, title, prompt, assigned_agent, status, created_by, priority, created_at, user_id, chat_id)
+     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`,
+  ).run(id, title, prompt, assignedAgent, createdBy, priority, now, userId ?? null, chatId ?? '');
 }
 
 export function getUnassignedMissionTasks(): MissionTask[] {
