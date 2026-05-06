@@ -407,7 +407,84 @@ function createSchema(database: Database.Database): void {
       total_cost  REAL NOT NULL DEFAULT 0,
       created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
     );
+
+    -- Multi-user: identity + role + status. Keyed by (platform,
+    -- platform_user_id) so a future src/discord.ts slots in without a
+    -- schema migration. platform_user_id is chat.id for Telegram (stored
+    -- as text because chat IDs can exceed 2^31 on some clients).
+    CREATE TABLE IF NOT EXISTS users (
+      id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+      platform            TEXT NOT NULL DEFAULT 'telegram'
+                          CHECK (platform IN ('telegram','discord')),
+      platform_user_id    TEXT NOT NULL,
+      platform_username   TEXT,
+      display_name        TEXT NOT NULL,
+      role                TEXT NOT NULL
+                          CHECK (role IN ('owner','admin','staff','restricted')),
+      status              TEXT NOT NULL DEFAULT 'active'
+                          CHECK (status IN ('active','locked','pending')),
+      pin_hash            TEXT,
+      idle_lock_minutes   INTEGER,
+      dashboard_token     TEXT UNIQUE,
+      created_at          INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      created_by          INTEGER REFERENCES users(id),
+      last_active_at      INTEGER,
+      UNIQUE (platform, platform_user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_users_platform_lookup
+      ON users(platform, platform_user_id);
+    CREATE INDEX IF NOT EXISTS idx_users_dashboard_token
+      ON users(dashboard_token);
+
+    -- Multi-user: skills granted per user. Owner is implicitly granted
+    -- everything (no rows needed); the can() helper short-circuits on
+    -- role='owner'. Absence of a row = denied.
+    CREATE TABLE IF NOT EXISTS user_skills (
+      user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      skill_name  TEXT NOT NULL,
+      granted_by  INTEGER REFERENCES users(id),
+      granted_at  INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      PRIMARY KEY (user_id, skill_name)
+    );
+
+    -- Multi-user: specialist-agent delegation rights.
+    CREATE TABLE IF NOT EXISTS user_agents (
+      user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      agent_id      TEXT NOT NULL,
+      can_delegate  INTEGER NOT NULL DEFAULT 1,
+      granted_by    INTEGER REFERENCES users(id),
+      granted_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      PRIMARY KEY (user_id, agent_id)
+    );
+
+    -- Multi-user: pending invites. Owner/admin generates a one-time
+    -- token via /invite; invitee redeems by sending /start <token>.
+    CREATE TABLE IF NOT EXISTS user_invites (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      token         TEXT NOT NULL UNIQUE,
+      invited_by    INTEGER NOT NULL REFERENCES users(id),
+      role          TEXT NOT NULL
+                    CHECK (role IN ('admin','staff','restricted')),
+      display_name  TEXT,
+      expires_at    INTEGER NOT NULL,
+      redeemed_at   INTEGER,
+      redeemed_by   INTEGER REFERENCES users(id),
+      created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_invites_token ON user_invites(token);
   `);
+}
+
+/**
+ * @internal — for src/users.ts and tests. Returns the live database
+ * handle so user-related queries can live in their own module without
+ * piping every helper through db.ts. Throws if the DB hasn't been
+ * initialised yet (mirrors how other helpers blow up on uninitialised
+ * access).
+ */
+export function _getDb(): Database.Database {
+  if (!db) throw new Error('Database not initialised. Call initDatabase() first.');
+  return db;
 }
 
 export function initDatabase(): void {
@@ -733,6 +810,45 @@ function runMigrations(database: Database.Database): void {
       ON conversation_log(source, source_meeting_id, source_turn_id, agent_id)
       WHERE source != 'telegram' AND role = 'assistant';
   `);
+
+  // ── Multi-user (v0.1.0) ────────────────────────────────────────────
+  // Add user_id to every per-chat table so each row carries the
+  // identity that owns it. Nullable for the migration window — an
+  // existing single-user install backfills via migrations/0.1.0/004 to
+  // the auto-promoted owner. Fresh installs start with NULLs that the
+  // application fills in as users are created.
+  addColumnIfMissing(database, 'sessions',          'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'memories',          'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'consolidations',    'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'scheduled_tasks',   'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'mission_tasks',     'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'conversation_log',  'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'token_usage',       'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'wa_message_map',    'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'wa_outbox',         'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'wa_messages',       'user_id', 'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'slack_messages',    'user_id', 'INTEGER REFERENCES users(id)');
+
+  // hive_mind + audit_log carry an *actor* user_id (who did the thing)
+  // and audit_log additionally a *target* user_id (who it was done to).
+  addColumnIfMissing(database, 'hive_mind', 'actor_user_id',  'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'audit_log', 'actor_user_id',  'INTEGER REFERENCES users(id)');
+  addColumnIfMissing(database, 'audit_log', 'target_user_id', 'INTEGER REFERENCES users(id)');
+
+  // mission_tasks gets chat_id directly so the scheduler doesn't need to
+  // fall back to ALLOWED_CHAT_ID when a task fires (see scheduler.ts:151).
+  addColumnIfMissing(database, 'mission_tasks', 'chat_id', `TEXT NOT NULL DEFAULT ''`);
+
+  // Indexes for the new user-scoped query patterns.
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS idx_memories_user      ON memories(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_sched_user         ON scheduled_tasks(user_id, status, next_run);
+    CREATE INDEX IF NOT EXISTS idx_missions_user      ON mission_tasks(user_id, status, priority DESC, created_at ASC);
+    CREATE INDEX IF NOT EXISTS idx_convo_user         ON conversation_log(user_id, agent_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_token_usage_user   ON token_usage(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_hive_actor         ON hive_mind(actor_user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_actor        ON audit_log(actor_user_id, created_at DESC);
+  `);
 }
 
 /** @internal - for tests only. Creates a fresh in-memory database. */
@@ -813,11 +929,12 @@ export function saveStructuredMemory(
   importance: number,
   source = 'conversation',
   agentId = 'main',
+  userId?: number,
 ): number {
   const now = Math.floor(Date.now() / 1000);
   const result = db.prepare(
-    `INSERT INTO memories (chat_id, source, raw_text, summary, entities, topics, importance, agent_id, created_at, accessed_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO memories (chat_id, source, raw_text, summary, entities, topics, importance, agent_id, user_id, created_at, accessed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     chatId,
     source,
@@ -827,6 +944,7 @@ export function saveStructuredMemory(
     JSON.stringify(topics),
     importance,
     agentId,
+    userId ?? null,
     now,
     now,
   );
@@ -973,9 +1091,10 @@ export function saveStructuredMemoryAtomic(
   embedding: number[],
   source = 'conversation',
   agentId = 'main',
+  userId?: number,
 ): number {
   const txn = db.transaction(() => {
-    const memoryId = saveStructuredMemory(chatId, rawText, summary, entities, topics, importance, source, agentId);
+    const memoryId = saveStructuredMemory(chatId, rawText, summary, entities, topics, importance, source, agentId, userId);
     if (embedding.length > 0) {
       saveMemoryEmbedding(memoryId, embedding);
     }
@@ -1241,12 +1360,13 @@ export function createScheduledTask(
   schedule: string,
   nextRun: number,
   agentId = 'main',
+  userId?: number,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO scheduled_tasks (id, prompt, schedule, next_run, status, created_at, agent_id)
-     VALUES (?, ?, ?, ?, 'active', ?, ?)`,
-  ).run(id, prompt, schedule, nextRun, now, agentId);
+    `INSERT INTO scheduled_tasks (id, prompt, schedule, next_run, status, created_at, agent_id, user_id)
+     VALUES (?, ?, ?, ?, 'active', ?, ?, ?)`,
+  ).run(id, prompt, schedule, nextRun, now, agentId, userId ?? null);
 }
 
 export function getDueTasks(agentId = 'main'): ScheduledTask[] {
@@ -1474,12 +1594,13 @@ export function logConversationTurn(
   content: string,
   sessionId?: string,
   agentId = 'main',
+  userId?: number,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO conversation_log (chat_id, session_id, role, content, created_at, agent_id)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(chatId, sessionId ?? null, role, content, now, agentId);
+    `INSERT INTO conversation_log (chat_id, session_id, role, content, created_at, agent_id, user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(chatId, sessionId ?? null, role, content, now, agentId, userId ?? null);
 }
 
 export function getRecentConversation(
@@ -1730,12 +1851,13 @@ export function saveTokenUsage(
   costUsd: number,
   didCompact: boolean,
   agentId = 'main',
+  userId?: number,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO token_usage (chat_id, session_id, input_tokens, output_tokens, cache_read, context_tokens, cost_usd, did_compact, created_at, agent_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(chatId, sessionId ?? null, inputTokens, outputTokens, cacheRead, contextTokens, costUsd, didCompact ? 1 : 0, now, agentId);
+    `INSERT INTO token_usage (chat_id, session_id, input_tokens, output_tokens, cache_read, context_tokens, cost_usd, did_compact, created_at, agent_id, user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(chatId, sessionId ?? null, inputTokens, outputTokens, cacheRead, contextTokens, costUsd, didCompact ? 1 : 0, now, agentId, userId ?? null);
 }
 
 export interface SessionTokenSummary {
@@ -1965,12 +2087,16 @@ export function logToHiveMind(
   action: string,
   summary: string,
   artifacts?: string,
+  /** Multi-user (v0.1.0): the human whose action triggered this hive
+   *  entry. Powers the per-role hive feed scoping (staff sees own;
+   *  admin sees team; owner sees all). */
+  actorUserId?: number,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO hive_mind (agent_id, chat_id, action, summary, artifacts, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(agentId, chatId, action, summary, artifacts ?? null, now);
+    `INSERT INTO hive_mind (agent_id, chat_id, action, summary, artifacts, created_at, actor_user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(agentId, chatId, action, summary, artifacts ?? null, now, actorUserId ?? null);
 }
 
 export function getHiveMindEntries(limit = 20, agentId?: string): HiveMindEntry[] {
@@ -2159,6 +2285,13 @@ export interface MissionTask {
   created_at: number;
   started_at: number | null;
   completed_at: number | null;
+  /** Multi-user (v0.1.0): owner of the task. NULL for legacy rows
+   *  created before migration; backfilled to owner.id by migration 004. */
+  user_id: number | null;
+  /** Multi-user (v0.1.0): chat to route the result back to. Empty
+   *  string for legacy rows; scheduler falls back to ALLOWED_CHAT_ID
+   *  in that case. */
+  chat_id: string;
 }
 
 export function createMissionTask(
@@ -2168,12 +2301,17 @@ export function createMissionTask(
   assignedAgent: string | null = null,
   createdBy = 'dashboard',
   priority = 0,
+  /** Multi-user (v0.1.0): identity of the human who queued the task. */
+  userId?: number,
+  /** Multi-user (v0.1.0): chat the result should land in. Removes the
+   *  ALLOWED_CHAT_ID fallback in scheduler.ts:151. */
+  chatId?: string,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO mission_tasks (id, title, prompt, assigned_agent, status, created_by, priority, created_at)
-     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)`,
-  ).run(id, title, prompt, assignedAgent, createdBy, priority, now);
+    `INSERT INTO mission_tasks (id, title, prompt, assigned_agent, status, created_by, priority, created_at, user_id, chat_id)
+     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`,
+  ).run(id, title, prompt, assignedAgent, createdBy, priority, now, userId ?? null, chatId ?? '');
 }
 
 export function getUnassignedMissionTasks(): MissionTask[] {
@@ -2394,10 +2532,21 @@ export function insertAuditLog(
   action: string,
   detail: string,
   blocked: boolean,
+  opts: { actorUserId?: number; targetUserId?: number } = {},
 ): void {
   db.prepare(
-    `INSERT INTO audit_log (agent_id, chat_id, action, detail, blocked, created_at) VALUES (?, ?, ?, ?, ?, strftime('%s','now'))`,
-  ).run(agentId, chatId, action, detail.slice(0, 2000), blocked ? 1 : 0);
+    `INSERT INTO audit_log
+       (agent_id, chat_id, action, detail, blocked, actor_user_id, target_user_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))`,
+  ).run(
+    agentId,
+    chatId,
+    action,
+    detail.slice(0, 2000),
+    blocked ? 1 : 0,
+    opts.actorUserId ?? null,
+    opts.targetUserId ?? null,
+  );
 }
 
 export interface AuditLogEntry {

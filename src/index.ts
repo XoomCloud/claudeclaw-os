@@ -141,7 +141,14 @@ async function main(): Promise<void> {
     killPhrase: EMERGENCY_KILL_PHRASE || undefined,
   });
   setAuditCallback((entry) => {
-    insertAuditLog(entry.agentId, entry.chatId, entry.action, entry.detail, entry.blocked);
+    insertAuditLog(
+      entry.agentId,
+      entry.chatId,
+      entry.action,
+      entry.detail,
+      entry.blocked,
+      { actorUserId: entry.actorUserId, targetUserId: entry.targetUserId },
+    );
   });
 
   initOrchestrator();

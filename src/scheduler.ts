@@ -17,6 +17,8 @@ import { logger } from './logger.js';
 import { messageQueue } from './message-queue.js';
 import { runAgent } from './agent.js';
 import { formatForTelegram, splitMessage } from './bot.js';
+import { resolveUserCwd } from './user-config.js';
+import { getUserById, type User } from './users.js';
 
 type Sender = (text: string) => Promise<void>;
 
@@ -58,6 +60,30 @@ export function initScheduler(send: Sender, agentId = 'main'): void {
   logger.info({ agentId }, 'Scheduler started (checking every 60s)');
 }
 
+/**
+ * Resolve the human a task belongs to. Looks up via task.user_id
+ * (post-migration), falls back to the auto-promoted owner row, and
+ * finally to ALLOWED_CHAT_ID for any pre-migration row that somehow
+ * survived the backfill. Returned `chatId` is `''` only when there's
+ * no owner at all, in which case the caller skips the conversation
+ * injection block (was the same outcome under the old code).
+ */
+function resolveTaskOwner(taskUserId: number | null | undefined): {
+  user: User | null;
+  chatId: string;
+  userCwd: string | undefined;
+} {
+  let user: User | null = null;
+  if (typeof taskUserId === 'number') {
+    user = getUserById(taskUserId);
+  }
+  // user_id can be null on pre-migration rows that somehow survived 004.
+  // Fallback chain mirrors the design doc: explicit user → ALLOWED_CHAT_ID.
+  const chatId = user?.platform_user_id || ALLOWED_CHAT_ID || '';
+  const userCwd = chatId ? (resolveUserCwd(chatId) ?? undefined) : undefined;
+  return { user, chatId, userCwd };
+}
+
 async function runDueTasks(): Promise<void> {
   const tasks = getDueTasks(schedulerAgentId);
 
@@ -80,11 +106,17 @@ async function runDueTasks(): Promise<void> {
 
     logger.info({ taskId: task.id, prompt: task.prompt.slice(0, 60) }, 'Firing task');
 
+    // Multi-user (v0.1.0): resolve the task's owner from task.user_id.
+    // Routes results back to that user's chat instead of always-owner,
+    // and uses their per-user CLAUDE.md if they have one.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const owner = resolveTaskOwner((task as any).user_id);
+    const queueKey = owner.chatId || 'scheduler';
+
     // Route through the message queue so scheduled tasks wait for any
     // in-flight user message to finish before running. This prevents
     // two Claude processes from hitting the same session simultaneously.
-    const chatId = ALLOWED_CHAT_ID || 'scheduler';
-    messageQueue.enqueue(chatId, async () => {
+    messageQueue.enqueue(queueKey, async () => {
       const abortController = new AbortController();
       const timeout = setTimeout(() => abortController.abort(), TASK_TIMEOUT_MS);
 
@@ -92,7 +124,10 @@ async function runDueTasks(): Promise<void> {
         await sender(`Scheduled task running: "${task.prompt.slice(0, 80)}${task.prompt.length > 80 ? '...' : ''}"`);
 
         // Run as a fresh agent call (no session — scheduled tasks are autonomous)
-        const result = await runAgent(task.prompt, undefined, () => {}, undefined, undefined, abortController, undefined, agentMcpAllowlist);
+        const result = await runAgent(
+          task.prompt, undefined, () => {}, undefined, undefined,
+          abortController, undefined, agentMcpAllowlist, owner.userCwd,
+        );
         clearTimeout(timeout);
 
         if (result.aborted) {
@@ -107,11 +142,12 @@ async function runDueTasks(): Promise<void> {
           await sender(chunk);
         }
 
-        // Inject task output into the active chat session so user replies have context
-        if (ALLOWED_CHAT_ID) {
-          const activeSession = getSession(ALLOWED_CHAT_ID, schedulerAgentId);
-          logConversationTurn(ALLOWED_CHAT_ID, 'user', `[Scheduled task]: ${task.prompt}`, activeSession ?? undefined, schedulerAgentId);
-          logConversationTurn(ALLOWED_CHAT_ID, 'assistant', text, activeSession ?? undefined, schedulerAgentId);
+        // Inject task output into the active chat session so user replies have context.
+        // Routes by the task's owner now, not the global ALLOWED_CHAT_ID.
+        if (owner.chatId) {
+          const activeSession = getSession(owner.chatId, schedulerAgentId);
+          logConversationTurn(owner.chatId, 'user', `[Scheduled task]: ${task.prompt}`, activeSession ?? undefined, schedulerAgentId, owner.user?.id);
+          logConversationTurn(owner.chatId, 'assistant', text, activeSession ?? undefined, schedulerAgentId, owner.user?.id);
         }
 
         updateTaskAfterRun(task.id, nextRun, text, 'success');
@@ -148,8 +184,17 @@ async function runDueMissionTasks(): Promise<void> {
 
   logger.info({ missionId: mission.id, title: mission.title }, 'Running mission task');
 
-  const chatId = ALLOWED_CHAT_ID || 'mission';
-  messageQueue.enqueue(chatId, async () => {
+  // Multi-user (v0.1.0): mission rows now carry user_id and chat_id
+  // directly. Mission's chat_id is the routing target; user_id is the
+  // ownership identity we pass through to per-user CLAUDE.md and
+  // conversation-log writes.
+  const owner = resolveTaskOwner(mission.user_id);
+  // mission.chat_id wins over the resolved owner.chatId because the
+  // task author may have explicitly chosen a different routing target.
+  const routingChatId = mission.chat_id || owner.chatId;
+  const queueKey = routingChatId || 'mission';
+
+  messageQueue.enqueue(queueKey, async () => {
     const abortController = new AbortController();
     const timeout = setTimeout(() => abortController.abort(), TASK_TIMEOUT_MS);
 
@@ -166,7 +211,10 @@ async function runDueMissionTasks(): Promise<void> {
     }, 5_000);
 
     try {
-      const result = await runAgent(mission.prompt, undefined, () => {}, undefined, undefined, abortController, undefined, agentMcpAllowlist);
+      const result = await runAgent(
+        mission.prompt, undefined, () => {}, undefined, undefined,
+        abortController, undefined, agentMcpAllowlist, owner.userCwd,
+      );
       clearTimeout(timeout);
       clearInterval(cancelPoll);
 
@@ -195,11 +243,13 @@ async function runDueMissionTasks(): Promise<void> {
           await sender(chunk);
         }
 
-        // Inject into conversation context so agent can reference it
-        if (ALLOWED_CHAT_ID) {
-          const activeSession = getSession(ALLOWED_CHAT_ID, schedulerAgentId);
-          logConversationTurn(ALLOWED_CHAT_ID, 'user', '[Mission task: ' + mission.title + ']: ' + mission.prompt, activeSession ?? undefined, schedulerAgentId);
-          logConversationTurn(ALLOWED_CHAT_ID, 'assistant', text, activeSession ?? undefined, schedulerAgentId);
+        // Inject into conversation context so agent can reference it.
+        // Per-user routing now — falls back gracefully when neither
+        // mission.chat_id nor a resolvable owner exists.
+        if (routingChatId) {
+          const activeSession = getSession(routingChatId, schedulerAgentId);
+          logConversationTurn(routingChatId, 'user', '[Mission task: ' + mission.title + ']: ' + mission.prompt, activeSession ?? undefined, schedulerAgentId, owner.user?.id);
+          logConversationTurn(routingChatId, 'assistant', text, activeSession ?? undefined, schedulerAgentId, owner.user?.id);
         }
       }
     } catch (err) {

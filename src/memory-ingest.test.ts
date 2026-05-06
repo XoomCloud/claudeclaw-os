@@ -130,6 +130,7 @@ describe('ingestConversationTurn', () => {
       expect.any(Array),
       'conversation',
       'main',
+      undefined, // userId — multi-user step 4 wiring
     );
   });
 
@@ -223,6 +224,7 @@ describe('ingestConversationTurn', () => {
       expect.any(Array),
       'conversation',
       'main',
+      undefined, // userId — multi-user step 4 wiring
     );
   });
 
@@ -299,6 +301,7 @@ describe('ingestConversationTurn', () => {
       expect.any(Array),
       'conversation',
       'main',
+      undefined, // userId — multi-user step 4 wiring
     );
   });
 

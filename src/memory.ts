@@ -250,18 +250,22 @@ export function saveConversationTurn(
   claudeResponse: string,
   sessionId?: string,
   agentId = 'main',
+  /** Multi-user (v0.1.0): the human who owns this turn. Threaded into
+   *  conversation_log + memory ingestion so per-user dashboard scoping
+   *  works without back-joining via chat_id. */
+  userId?: number,
 ): void {
   try {
     // Always log full conversation to conversation_log (for /respin)
-    logConversationTurn(chatId, 'user', userMessage, sessionId, agentId);
-    logConversationTurn(chatId, 'assistant', claudeResponse, sessionId, agentId);
+    logConversationTurn(chatId, 'user', userMessage, sessionId, agentId, userId);
+    logConversationTurn(chatId, 'assistant', claudeResponse, sessionId, agentId, userId);
   } catch (err) {
     logger.error({ err }, 'Failed to log conversation turn');
   }
 
   // Fire-and-forget: LLM-powered memory extraction via Gemini
   // This runs async and never blocks the user's response
-  void ingestConversationTurn(chatId, userMessage, claudeResponse, agentId).catch((err) => {
+  void ingestConversationTurn(chatId, userMessage, claudeResponse, agentId, userId).catch((err) => {
     logger.error({ err }, 'Memory ingestion fire-and-forget failed');
   });
 }

@@ -143,13 +143,20 @@ describe('saveConversationTurn', () => {
 
   it('logs both user and assistant messages to conversation log', () => {
     saveConversationTurn('chat1', 'hello world from the user!!!', 'Noted.');
-    expect(mockLogConversationTurn).toHaveBeenCalledWith('chat1', 'user', 'hello world from the user!!!', undefined, 'main');
-    expect(mockLogConversationTurn).toHaveBeenCalledWith('chat1', 'assistant', 'Noted.', undefined, 'main');
+    expect(mockLogConversationTurn).toHaveBeenCalledWith('chat1', 'user', 'hello world from the user!!!', undefined, 'main', undefined);
+    expect(mockLogConversationTurn).toHaveBeenCalledWith('chat1', 'assistant', 'Noted.', undefined, 'main', undefined);
   });
 
   it('fires async ingestion', () => {
     saveConversationTurn('chat1', 'I prefer TypeScript over JavaScript always and forever', 'Noted.');
-    expect(mockIngest).toHaveBeenCalledWith('chat1', 'I prefer TypeScript over JavaScript always and forever', 'Noted.', 'main');
+    expect(mockIngest).toHaveBeenCalledWith('chat1', 'I prefer TypeScript over JavaScript always and forever', 'Noted.', 'main', undefined);
+  });
+
+  it('threads userId through to log + ingestion (multi-user step 4)', () => {
+    saveConversationTurn('chat1', 'I prefer TypeScript', 'Noted.', 'sess-x', 'main', 42);
+    expect(mockLogConversationTurn).toHaveBeenCalledWith('chat1', 'user', 'I prefer TypeScript', 'sess-x', 'main', 42);
+    expect(mockLogConversationTurn).toHaveBeenCalledWith('chat1', 'assistant', 'Noted.', 'sess-x', 'main', 42);
+    expect(mockIngest).toHaveBeenCalledWith('chat1', 'I prefer TypeScript', 'Noted.', 'main', 42);
   });
 });
 

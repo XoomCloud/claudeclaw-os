@@ -163,6 +163,11 @@ export async function ingestConversationTurn(
   userMessage: string,
   assistantResponse: string,
   agentId = 'main',
+  /** Multi-user (v0.1.0): tag the new memory with the human who owns
+   *  this conversation. NULL for paths that don't yet have user
+   *  identity (war room, legacy callers); migration 004 backfills any
+   *  pre-existing rows to the owner. */
+  userId?: number,
 ): Promise<boolean> {
   // Hard filter: skip very short messages and commands
   if (userMessage.length <= 15 || userMessage.startsWith('/')) return false;
@@ -241,6 +246,7 @@ export async function ingestConversationTurn(
       embedding,
       'conversation',
       agentId,
+      userId,
     );
 
     // Notify on high-importance memories so the user can pin them

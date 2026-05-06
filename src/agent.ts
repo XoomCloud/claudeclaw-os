@@ -181,6 +181,13 @@ export async function runAgent(
   abortController?: AbortController,
   onStreamText?: (accumulatedText: string) => void,
   mcpAllowlist?: string[],
+  /**
+   * Multi-user (v0.1.0): when set, the SDK uses this directory as cwd
+   * so `users/<chat_id>/CLAUDE.md` loads instead of the agent-level
+   * one. Caller resolves the path via src/user-config.ts. When unset,
+   * falls back to agentCwd ?? PROJECT_ROOT (today's behavior).
+   */
+  userCwd?: string,
 ): Promise<AgentResult> {
   // Centralized kill-switch enforcement. Throws KillSwitchDisabledError if
   // LLM_SPAWN_ENABLED has been flipped off — caller is expected to surface
@@ -217,8 +224,12 @@ export async function runAgent(
     // Load MCP servers from project + user settings files, filtered by agent allowlist
     const mcpServers = loadMcpServers(mcpAllowlist);
     const mcpServerNames = Object.keys(mcpServers);
+    // Per-user CLAUDE.md takes precedence over the agent-level one
+    // when present (multi-user v0.1.0). Default falls through to the
+    // single-user behavior.
+    const cwdForSdk = userCwd ?? agentCwd ?? PROJECT_ROOT;
     logger.info(
-      { sessionId: sessionId ?? 'new', messageLen: message.length, mcpServers: mcpServerNames },
+      { sessionId: sessionId ?? 'new', messageLen: message.length, mcpServers: mcpServerNames, cwd: cwdForSdk },
       'Starting agent query',
     );
 
@@ -228,9 +239,10 @@ export async function runAgent(
     for await (const event of query({
       prompt: singleTurn(message),
       options: {
-        // cwd = agent directory (if running as agent) or project root.
-        // Claude Code loads CLAUDE.md from cwd via settingSources: ['project'].
-        cwd: agentCwd ?? PROJECT_ROOT,
+        // cwd = per-user dir (if a user CLAUDE.md exists) ↦ agent
+        // directory ↦ project root. The SDK loads CLAUDE.md from this
+        // dir via settingSources: ['project'].
+        cwd: cwdForSdk,
 
         // Resume the previous session for this chat (persistent context)
         resume: sessionId,
@@ -421,6 +433,8 @@ export async function runAgentWithRetry(
   onRetry?: (attempt: number, error: AgentError) => void,
   fallbackModels?: string[],
   mcpAllowlist?: string[],
+  /** Multi-user (v0.1.0): forwarded to runAgent for per-user CLAUDE.md. */
+  userCwd?: string,
 ): Promise<AgentResult> {
   let lastError: AgentError | undefined;
 
@@ -435,7 +449,7 @@ export async function runAgentWithRetry(
       return await runAgent(
         message, sessionId, onTyping, onProgress,
         currentModel, abortController, onStreamText,
-        mcpAllowlist,
+        mcpAllowlist, userCwd,
       );
     } catch (err) {
       if (!(err instanceof AgentError)) throw err;
