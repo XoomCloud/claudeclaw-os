@@ -20,6 +20,12 @@
     "status": "tsx scripts/status.ts",
     "agent:create": "bash scripts/agent-create.sh",
     "agent:start": "node dist/index.js --agent",
+    "user:list": "tsx src/user-create-cli.ts list",
+    "user:add": "tsx src/user-create-cli.ts add",
+    "user:remove": "tsx src/user-create-cli.ts remove",
+    "user:grant": "tsx src/user-create-cli.ts grant",
+    "user:revoke": "tsx src/user-create-cli.ts revoke",
+    "user:show": "tsx src/user-create-cli.ts show",
     "uninstall": "bash scripts/uninstall.sh",
     "build:warroom-client": "esbuild warroom/client.js --bundle --outfile=warroom/client.bundle.js --format=iife --global-name=PipecatWarRoom"
   },

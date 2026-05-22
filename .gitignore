@@ -108,6 +108,10 @@ agents/*/CLAUDE.md
 agents/*/avatar.png
 agents/*/.no-avatar
 agents/*/CLAUDE.md.backup
+# Per-user CLAUDE.md follows the same "personal data → outside repo" rule.
+# Exception: the template that ships with the repo so the wizard can copy it.
+users/*/CLAUDE.md
+!users/_template/CLAUDE.md
 agents/*/agent.yaml.backup
 
 # Local Claude Code skills — these are user-specific workflow configs

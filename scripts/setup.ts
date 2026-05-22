@@ -1179,6 +1179,27 @@ async function main() {
   info('Re-run npm run setup to change API keys or service settings.');
   console.log();
 
+  // ── 17. Multi-user setup hint ─────────────────────────────────────────────
+  // We don't provision additional users from inside the wizard because the
+  // DB isn't initialised until the bot has run at least once (the
+  // checkPendingMigrations guard refuses startup with pending migrations
+  // until `npm run migrate` runs). After the first start, the
+  // ALLOWED_CHAT_ID we wrote above gets auto-promoted to the owner row by
+  // migration 002, and the operator can add teammates via /invite in
+  // Telegram or the user-create CLI.
+  const wantTeam = await confirm('Will more than one human use this install?', false);
+  if (wantTeam) {
+    console.log();
+    info('Multi-user mode enabled. After the bot starts and the first message');
+    info('from your chat lands, your account becomes the install owner.');
+    console.log();
+    bullet('To invite a teammate, message your bot: /invite staff @theirhandle');
+    bullet('Or from the shell: npm run user:add -- --chat-id <id> --name "Name" --role staff');
+    bullet('List the team: npm run user:list');
+    bullet('See the full guide: docs/multi-user-guide.md (ships in step 8)');
+    console.log();
+  }
+
   // Offer to start the bot right now
   const startNow = await confirm('Start the bot now?');
   if (startNow) {

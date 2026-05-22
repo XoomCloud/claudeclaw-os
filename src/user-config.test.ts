@@ -86,10 +86,17 @@ describe('user-config', () => {
       const real = '55555551';
       const realDir = path.join(REPO_USERS_DIR, real);
       const tmpl = path.join(REPO_USERS_DIR, '_template');
-      createdDirs.push(realDir, tmpl);
+      // The repo ships a real users/_template/CLAUDE.md (step 6).
+      // Don't include it in createdDirs — we'd wipe a checked-in file.
+      // listUserDirs filters _template out by name regardless.
+      createdDirs.push(realDir);
       writeUserClaudeMd(real, '# Real user');
-      fs.mkdirSync(tmpl, { recursive: true });
-      fs.writeFileSync(path.join(tmpl, 'CLAUDE.md'), '# Template');
+      const tmplExisted = fs.existsSync(tmpl);
+      if (!tmplExisted) {
+        fs.mkdirSync(tmpl, { recursive: true });
+        fs.writeFileSync(path.join(tmpl, 'CLAUDE.md'), '# Template');
+        createdDirs.push(tmpl);
+      }
 
       const ids = listUserDirs();
       expect(ids).toContain(real);

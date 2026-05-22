@@ -2557,6 +2557,10 @@ export interface AuditLogEntry {
   detail: string;
   blocked: number;
   created_at: number;
+  /** Multi-user (v0.1.0): the human who triggered the action. */
+  actor_user_id: number | null;
+  /** Multi-user (v0.1.0): the human the action was performed on. */
+  target_user_id: number | null;
 }
 
 export function getAuditLog(limit = 50, offset = 0, agentId?: string): AuditLogEntry[] {
